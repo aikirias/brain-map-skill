@@ -233,8 +233,11 @@ TEMPLATE = r"""<!DOCTYPE html>
   .chip{display:inline-flex;gap:6px;align-items:center;font-size:12px;color:var(--muted)}
   .dot{width:9px;height:9px;border-radius:50%}
   /* left controls */
-  #side{position:fixed;left:18px;top:78px;width:248px;padding:16px;z-index:6;
-     max-height:calc(100vh - 226px);overflow-y:auto;overscroll-behavior:contain}
+  #side{position:fixed;left:18px;top:86px;width:248px;padding:16px;z-index:6;
+     max-height:calc(100vh - 240px);display:flex;flex-direction:column;overflow:hidden}
+  .side-head{flex:0 0 auto}
+  .side-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;
+     margin:2px -6px 0 0;padding-right:6px}
   #side h2{font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);
      margin:2px 0 10px}
   #search{width:100%;padding:9px 12px;border-radius:10px;border:1px solid var(--line);
@@ -262,12 +265,12 @@ TEMPLATE = r"""<!DOCTYPE html>
   .iconbtn.off{opacity:.4}
   .iconbtn svg{width:16px;height:16px;display:block}
   /* detail */
-  #detail{position:fixed;right:18px;top:78px;width:330px;padding:16px;z-index:6;display:none;
-     max-height:calc(100vh - 226px);overflow-y:auto;overscroll-behavior:contain}
-  #side::-webkit-scrollbar,#detail::-webkit-scrollbar{width:8px}
-  #side::-webkit-scrollbar-thumb,#detail::-webkit-scrollbar-thumb{
+  #detail{position:fixed;right:18px;top:86px;width:330px;padding:16px;z-index:6;display:none;
+     max-height:calc(100vh - 240px);overflow-y:auto;overscroll-behavior:contain}
+  .side-scroll::-webkit-scrollbar,#detail::-webkit-scrollbar{width:8px}
+  .side-scroll::-webkit-scrollbar-thumb,#detail::-webkit-scrollbar-thumb{
      background:rgba(148,163,184,.28);border-radius:8px}
-  #side::-webkit-scrollbar-track,#detail::-webkit-scrollbar-track{background:transparent}
+  .side-scroll::-webkit-scrollbar-track,#detail::-webkit-scrollbar-track{background:transparent}
   #detail .t{font-size:16px;font-weight:650;margin:0 0 4px;line-height:1.3}
   #detail .meta{color:var(--muted);font-size:12px;margin-bottom:12px}
   #detail .tags{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
@@ -303,8 +306,8 @@ TEMPLATE = r"""<!DOCTYPE html>
     #top h1{font-size:14px}
     #top #src{max-width:42vw;font-size:10.5px}
     #top .vsep,#top #counts{display:none}
-    #side{left:10px;top:62px;width:min(240px,56vw);padding:12px;max-height:38vh}
-    #detail{left:10px;right:10px;top:62px;width:auto;padding:12px;max-height:calc(100vh - 200px)}
+    #side{left:10px;top:66px;width:min(240px,56vw);padding:12px;max-height:40vh}
+    #detail{left:10px;right:10px;top:66px;width:auto;padding:12px;max-height:calc(100vh - 204px)}
     #tl{left:10px;right:10px;bottom:10px;height:104px;padding:10px 12px 2px}
     #tlchart{height:72px}
     .hint{display:none}
@@ -328,15 +331,19 @@ TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <div id="side" class="glass">
-  <h2>Search</h2>
-  <input id="search" placeholder="Filter nodes…" autocomplete="off">
-  <div class="sec"><h2>Themes</h2><div id="themeFilters"></div></div>
-  <div class="sec"><h2>Types</h2><div id="typeFilters"></div></div>
-  <div class="sec btnrow">
-    <button class="btn" id="fit">Reset view</button>
-    <button class="iconbtn" id="toggleEdges" title="Toggle links" aria-label="Toggle links">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="12" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="18" cy="18" r="2.4"/><line x1="8.2" y1="10.9" x2="15.8" y2="7.1"/><line x1="8.2" y1="13.1" x2="15.8" y2="16.9"/></svg>
-    </button>
+  <div class="side-head">
+    <h2>Search</h2>
+    <input id="search" placeholder="Filter nodes…" autocomplete="off">
+    <div class="btnrow">
+      <button class="btn" id="fit">Reset view</button>
+      <button class="iconbtn" id="toggleEdges" title="Toggle links" aria-label="Toggle links">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="12" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="18" cy="18" r="2.4"/><line x1="8.2" y1="10.9" x2="15.8" y2="7.1"/><line x1="8.2" y1="13.1" x2="15.8" y2="16.9"/></svg>
+      </button>
+    </div>
+  </div>
+  <div class="side-scroll">
+    <div class="sec"><h2>Themes</h2><div id="themeFilters"></div></div>
+    <div class="sec"><h2>Types</h2><div id="typeFilters"></div></div>
   </div>
 </div>
 
