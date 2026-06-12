@@ -1,0 +1,5 @@
+# Optional — only for the pre-computed layout (prettier + instant on 1000+ nodes).
+# Without these, build_map.py still works: the browser computes the layout (Cytoscape cose).
+networkx>=3.0
+numpy>=1.24
+scipy>=1.10

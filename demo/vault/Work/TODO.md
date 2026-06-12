@@ -1,0 +1,63 @@
+---
+tags: [work, todo]
+created: 2026-05-29T11:16:00
+---
+# TODO
+
+# Work TODO
+
+- [ ] follow up incident on  _(added 2026-05-17 14:13)_
+- [ ] review PERC- depth filter _(added 2026-01-11 16:26)_
+- [ ] prep 1:1 notes for  _(added 2026-02-17 19:41)_
+- [ ] write ADR for  _(added 2025-10-19 18:16)_
+- [ ] add regression test for  _(added 2026-03-09 16:22)_
+- [ ] review PERC- depth filter _(added 2026-05-06 20:37)_
+- [ ] write ADR for  _(added 2026-01-01 14:52)_
+- [ ] follow up incident on  _(added 2025-12-29 08:34)_
+- [ ] update runbook section on  _(added 2026-01-28 15:24)_
+- [ ] review PERC- depth filter _(added 2026-03-03 16:30)_
+- [ ] follow up incident on  _(added 2026-05-05 09:49)_
+- [ ] write ADR for  _(added 2025-11-07 21:39)_
+- [ ] prep 1:1 notes for  _(added 2025-09-24 17:43)_
+- [ ] prep 1:1 notes for  _(added 2025-10-13 13:48)_
+- [ ] add regression test for  _(added 2026-03-26 08:07)_
+- [ ] prep 1:1 notes for  _(added 2026-06-01 09:48)_
+- [ ] add regression test for  _(added 2025-07-31 08:09)_
+- [ ] prep 1:1 notes for  _(added 2026-01-20 13:49)_
+- [ ] follow up incident on  _(added 2025-08-06 19:01)_
+- [ ] add regression test for  _(added 2025-07-21 13:29)_
+- [ ] follow up incident on  _(added 2025-08-03 07:08)_
+- [ ] prep 1:1 notes for  _(added 2025-11-22 19:26)_
+- [ ] prep 1:1 notes for  _(added 2026-05-20 20:21)_
+- [ ] update runbook section on  _(added 2026-04-22 21:56)_
+- [ ] write ADR for  _(added 2026-02-21 15:23)_
+- [ ] add regression test for  _(added 2026-04-15 08:50)_
+- [ ] review PERC- depth filter _(added 2025-09-04 19:17)_
+- [ ] update runbook section on  _(added 2025-12-12 16:11)_
+- [ ] write ADR for  _(added 2025-11-10 18:12)_
+- [ ] review PERC- depth filter _(added 2025-10-14 15:08)_
+- [ ] prep 1:1 notes for  _(added 2025-12-16 16:06)_
+- [ ] write ADR for  _(added 2025-07-31 15:04)_
+- [ ] update runbook section on  _(added 2025-08-14 14:43)_
+- [ ] follow up incident on  _(added 2026-06-02 18:54)_
+- [ ] review PERC- depth filter _(added 2026-04-12 07:49)_
+- [ ] review PERC- depth filter _(added 2026-02-01 07:03)_
+- [ ] update runbook section on  _(added 2026-06-08 12:32)_
+- [ ] review PERC- depth filter _(added 2026-04-02 07:29)_
+- [ ] review PERC- depth filter _(added 2026-04-09 13:58)_
+- [ ] add regression test for  _(added 2026-03-24 14:39)_
+- [ ] write ADR for  _(added 2026-02-15 13:38)_
+- [ ] prep 1:1 notes for  _(added 2025-11-21 20:28)_
+- [ ] prep 1:1 notes for  _(added 2026-05-23 13:53)_
+- [ ] add regression test for  _(added 2026-04-25 14:55)_
+- [ ] prep 1:1 notes for  _(added 2025-07-31 07:03)_
+- [ ] update runbook section on  _(added 2025-12-28 21:02)_
+- [ ] add regression test for  _(added 2025-11-17 09:56)_
+- [ ] follow up incident on  _(added 2026-06-08 13:55)_
+- [ ] add regression test for  _(added 2025-06-06 17:19)_
+- [ ] add regression test for  _(added 2025-12-11 13:42)_
+- [ ] prep 1:1 notes for  _(added 2026-05-31 15:46)_
+- [ ] prep 1:1 notes for  _(added 2026-05-15 20:54)_
+- [ ] write ADR for  _(added 2025-08-30 11:06)_
+- [ ] add regression test for  _(added 2025-06-21 22:58)_
+- [ ] add regression test for  _(added 2025-11-24 22:51)_
