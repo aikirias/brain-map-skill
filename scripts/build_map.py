@@ -29,6 +29,37 @@ THEME_COLORS = {
     "Life":  "#fb923c",   # amber
     "Other": "#94a3b8",   # slate
 }
+
+# Themes are data-driven: every top-level folder in the notes dir becomes a theme.
+# Work/Study/Life keep their legacy colors when present; root-level notes (no
+# folder) fall under "Other". Any other folder draws a stable color from this
+# palette, so the map fits ANY vault's own categories — no fixed taxonomy imposed.
+THEME_PALETTE = [
+    "#38bdf8", "#a78bfa", "#fb923c", "#34d399", "#f472b6", "#facc15",
+    "#60a5fa", "#c084fc", "#fb7185", "#4ade80", "#22d3ee", "#fbbf24",
+    "#a3e635", "#e879f9", "#2dd4bf", "#f87171", "#818cf8", "#fdba74",
+    "#5eead4", "#fca5a5",
+]
+THEME_OTHER = "#94a3b8"
+
+def assign_theme_colors(theme_counts):
+    """Map each observed theme -> color. Canonical Work/Study/Life keep their
+    legacy colors; "Other" is slate; the rest draw from THEME_PALETTE in a stable
+    order (size desc, then name) so re-runs are deterministic."""
+    canon = {"Work": "#38bdf8", "Study": "#a78bfa", "Life": "#fb923c"}
+    colors = {"Other": THEME_OTHER}
+    used = {THEME_OTHER}
+    for k, c in canon.items():
+        if k in theme_counts:
+            colors[k] = c; used.add(c)
+    pal = [c for c in THEME_PALETTE if c not in used]
+    i = 0
+    for name in sorted((t for t in theme_counts if t not in colors),
+                       key=lambda t: (-theme_counts[t], t.lower())):
+        colors[name] = pal[i % len(pal)] if pal else THEME_OTHER
+        i += 1
+    return colors
+
 TYPE_SHAPES = {
     "person":  "ellipse",
     "meeting": "round-diamond",
@@ -95,12 +126,19 @@ def load(vault):
             body = text[fmm.end():] if fmm else text
             h1 = H1_RE.search(body)
             title = (h1.group(1).strip() if h1 else os.path.splitext(fn)[0]).strip()
-            theme = rel.split(os.sep)[0]
-            theme = theme if theme in THEME_COLORS else "Other"
+            parts = rel.split(os.sep)
+            theme = parts[0] if len(parts) > 1 else "Other"  # top folder = theme; root notes = Other
             tags = fm.get("tags", [])
             if isinstance(tags, str): tags = [tags]
             stype = subtype_of(rel, [t.lower() for t in tags], title)
             created = fm.get("created", "")
+            if not created:  # vanilla vaults often lack a date — fall back to the file's own timestamp
+                try:
+                    st = os.stat(path)
+                    ts = getattr(st, "st_birthtime", 0) or st.st_mtime
+                    created = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%S")
+                except OSError:
+                    created = ""
             if title in nodes:  # collision: keep first, skip dup title
                 title = f"{title} ⟨{hashlib.md5(rel.encode()).hexdigest()[:4]}⟩"
             nodes[title] = {
@@ -128,9 +166,14 @@ def layout(nodes, edges):
     G = nx.Graph()
     G.add_nodes_from(nodes.keys())
     for e in edges: G.add_edge(e["source"], e["target"])
-    # seed by theme so clusters separate cleanly
+    # seed by theme so clusters separate cleanly — anchors generated on a ring
+    # for whatever themes exist, with "Other" parked in the middle.
     import math
-    theme_anchor = {"Work": (-1.0, 0.0), "Study": (1.0, 0.6), "Life": (0.2, -1.0), "Other": (0.0, 0.0)}
+    ring = sorted({n["theme"] for n in nodes.values()} - {"Other"})
+    theme_anchor = {t: (math.cos(2 * math.pi * i / max(1, len(ring))),
+                        math.sin(2 * math.pi * i / max(1, len(ring))))
+                    for i, t in enumerate(ring)}
+    theme_anchor["Other"] = (0.0, 0.0)
     init = {}
     for nid, n in nodes.items():
         ax, ay = theme_anchor.get(n["theme"], (0, 0))
@@ -166,12 +209,13 @@ def build(vault, title, source_label=None):
     cy_edges = [{"data": {"id": f"e{i}", "source": e["source"], "target": e["target"],
                           "theme": nodes[e["source"]]["theme"]}}
                 for i, e in enumerate(edges)]
-    # timeline buckets (month)
+    # timeline buckets (month) — keyed by whatever themes exist
+    all_themes = sorted({n["theme"] for n in nodes.values()})
     months = {}
     for n in nodes.values():
         c = n["created"][:7]
         if re.match(r"\d{4}-\d{2}", c):
-            months.setdefault(c, {"Work": 0, "Study": 0, "Life": 0, "Other": 0})
+            months.setdefault(c, {t: 0 for t in all_themes})
             months[c][n["theme"]] += 1
     timeline = [{"month": m, **months[m]} for m in sorted(months)]
     themes = {}
@@ -179,6 +223,8 @@ def build(vault, title, source_label=None):
     for n in nodes.values():
         themes[n["theme"]] = themes.get(n["theme"], 0) + 1
         types[n["type"]] = types.get(n["type"], 0) + 1
+    theme_colors = assign_theme_colors(themes)
+    theme_order = sorted(themes, key=lambda t: (t == "Other", -themes[t], t.lower()))
     src_abs = os.path.abspath(vault)
     parts = src_abs.split(os.sep)
     short = (".../" + "/".join(parts[-3:])) if len(parts) > 4 else src_abs
@@ -186,7 +232,8 @@ def build(vault, title, source_label=None):
         "title": title, "nodes": cy_nodes, "edges": cy_edges,
         "source": source_label or short, "sourceFull": src_abs,
         "layout": "preset" if use_preset else "cose",
-        "timeline": timeline, "themeColors": THEME_COLORS, "typeShapes": TYPE_SHAPES,
+        "timeline": timeline, "themeColors": theme_colors, "themeOrder": theme_order,
+        "typeShapes": TYPE_SHAPES,
         "stats": {"nodes": len(nodes), "edges": len(edges),
                   "themes": themes, "types": types,
                   "span": [min((n["created"][:10] for n in nodes.values() if n["created"]), default=""),
@@ -448,7 +495,7 @@ buildFilters('typeFilters', DATA.stats.types, typeOn, false);
 const months = DATA.timeline.map(m=>m.month);
 function cutoffMonth(){ const idx=Math.max(0,Math.ceil(cutoff*months.length)-1); return months[idx]||months[months.length-1]; }
 
-const TL_ORDER=['Work','Study','Life','Other'];
+const TL_ORDER = DATA.themeOrder || Object.keys(DATA.themeColors);
 const MN=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const chart=document.getElementById('tlchart');
 const svg=document.getElementById('tlsvg');
@@ -460,7 +507,7 @@ function buildTimeline(){
   const PAD={l:14,r:14,t:14,b:20};
   const w=chart.clientWidth||900, h=chart.clientHeight||98;
   const iw=w-PAD.l-PAD.r, ih=h-PAD.t-PAD.b, n=DATA.timeline.length;
-  let cum={Work:0,Study:0,Life:0,Other:0};
+  let cum={}; TL_ORDER.forEach(t=>cum[t]=0);
   const pts=DATA.timeline.map(m=>{ TL_ORDER.forEach(t=>cum[t]+=m[t]||0); return Object.assign({},cum); });
   const total=TL_ORDER.reduce((s,t)=>s+cum[t],0)||1;
   const X=i=> PAD.l + (n>1? i/(n-1):0)*iw;
@@ -474,15 +521,15 @@ function buildTimeline(){
     return d+'Z';
   }
   let defs='<defs>';
-  TL_ORDER.forEach(t=>{ const c=TC[t]||TC.Other;
-    defs+='<linearGradient id="g_'+t+'" x1="0" y1="0" x2="0" y2="1">'+
+  TL_ORDER.forEach((t,k)=>{ const c=TC[t]||TC.Other;   // id by index — theme names may hold spaces/non-ASCII
+    defs+='<linearGradient id="g_'+k+'" x1="0" y1="0" x2="0" y2="1">'+
       '<stop offset="0" stop-color="'+c+'" stop-opacity="0.95"/>'+
       '<stop offset="1" stop-color="'+c+'" stop-opacity="0.30"/></linearGradient>';});
   defs+='<clipPath id="past"><rect id="pastrect" x="'+PAD.l+'" y="0" width="0" height="'+h+'"/></clipPath></defs>';
   let dim='', bright='';
   TL_ORDER.forEach((t,k)=>{ if(!cum[t]) return; const p=areaPath(k);
-    dim+='<path d="'+p+'" fill="url(#g_'+t+')" opacity="0.15"/>';
-    bright+='<path d="'+p+'" fill="url(#g_'+t+')" opacity="0.92"/>';});
+    dim+='<path d="'+p+'" fill="url(#g_'+k+')" opacity="0.15"/>';
+    bright+='<path d="'+p+'" fill="url(#g_'+k+')" opacity="0.92"/>';});
   let axis='<line x1="'+PAD.l+'" y1="'+(PAD.t+ih)+'" x2="'+(w-PAD.r)+'" y2="'+(PAD.t+ih)+'" stroke="rgba(148,163,184,.22)"/>';
   const step=Math.max(1,Math.ceil(n/Math.max(3,Math.floor(iw/66))));
   for(let i=0;i<n;i+=step){ axis+='<text x="'+X(i).toFixed(1)+'" y="'+(h-5)+'" fill="#7f93b0" font-size="10" text-anchor="middle">'+shortMonth(months[i])+'</text>';
@@ -514,10 +561,11 @@ svg.addEventListener('pointermove',e=>{
   const i=Math.round(((e.clientX-r.left)-PAD.l)/iw*(n-1));
   if(i>=0 && i<n){ const m=DATA.timeline[i];
     tip.style.display='block'; tip.style.left=(e.clientX-r.left)+'px';
-    tip.innerHTML='<b>'+shortMonth(months[i])+'</b> · +'+(m.Work+m.Study+m.Life+m.Other)+' that month<br>'+
-      '<span style="color:'+TC.Work+'">Work '+m.Work+'</span> · '+
-      '<span style="color:'+TC.Study+'">Study '+m.Study+'</span> · '+
-      '<span style="color:'+TC.Life+'">Life '+m.Life+'</span>'; }
+    const tot=TL_ORDER.reduce((s,t)=>s+(m[t]||0),0);
+    tip.innerHTML='<b>'+shortMonth(months[i])+'</b> · +'+tot+' that month<br>'+
+      TL_ORDER.filter(t=>(m[t]||0)>0)
+              .map(t=>'<span style="color:'+(TC[t]||TC.Other)+'">'+t+' '+(m[t]||0)+'</span>')
+              .join(' · '); }
 });
 svg.addEventListener('pointerup',()=>{tlDrag=false;});
 svg.addEventListener('pointerleave',()=>{tip.style.display='none';});

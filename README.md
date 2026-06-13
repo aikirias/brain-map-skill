@@ -44,11 +44,15 @@ no server required either way.
 
 ## What it reads
 
-- **Theme** = top-level folder (`Work/`, `Study/`, `Life/`) → node & edge colour.
+- **Theme** = top-level folder — _your_ folders, whatever they are → node & edge colour.
+  Colours are assigned automatically from a palette (no fixed taxonomy); `Work/`,
+  `Study/`, `Life/` keep their legacy colours if present, root-level notes are `Other`.
 - **Type** = subfolder / tags → node shape (person, meeting, journal, lecture, project,
   link, todo, index, note).
 - **Edges** = resolved `[[wikilinks]]`. Node size scales with link count; hubs get labels.
-- **Timeline** = `created` timestamps, bucketed by month, stacked by theme.
+- **Timeline** = `created` timestamps, bucketed by month, stacked by theme. No `created`
+  in the frontmatter? It falls back to the file's own timestamp, so plain vaults still
+  get a timeline.
 
 The richer your cross-linking (people cards, meeting attendees, index pages), the more
 legible the map. Designed to pair with the [save-note](https://github.com/vladignatyev/save-note-skill)

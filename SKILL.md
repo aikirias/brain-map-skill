@@ -49,14 +49,18 @@ Open `out.html`. It's one file, Cytoscape loaded from CDN.
 
 ## How it reads the notes
 
-- **Theme** = top-level folder (`Work/`, `Study/`, `Life/` → coloured; anything
-  else → "Other"). Drives node + edge colour.
+- **Theme** = top-level folder — _your own_ folders become the themes, each given a
+  stable colour from a palette (no fixed taxonomy is imposed). `Work/`, `Study/`,
+  `Life/` keep their legacy colours when present; root-level notes → "Other". Drives
+  node + edge colour.
 - **Type** = subfolder/tags → node shape: `People/`→person, `Meetings/`→meeting,
   `Journal/`→journal, `Lectures/`→lecture, `Project/`→project, `Links/`→link,
   `todo`/`index` tags → those; else `note`.
 - **Edges** = resolved `[[wikilinks]]` (matched by note title). Node size scales
   with degree; nodes with ≥7 links get a permanent label (the hubs).
-- **Timeline** = `created` timestamps bucketed by month, stacked by theme.
+- **Timeline** = `created` timestamps bucketed by month, stacked by theme. When a
+  note has no `created` in its frontmatter, the file's own birth/modified time is
+  used instead, so vanilla Obsidian vaults still get a timeline.
 
 Richer cross-linking (people cards, meeting attendees, index/MOC pages) ⇒ a more
 legible map. save-note's people-registry + `[[links]]` are what make it cluster.
