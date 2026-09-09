@@ -7,13 +7,22 @@ Graph  : Cytoscape.js, force-directed positions pre-computed here (networkx
          spring layout) so a 1000-node map opens instantly.
 Time   : a brushable timeline strip (built from each note's `created`) that
          filters the graph — scrub or hit Play to watch the brain grow.
-Facts  : click any node for its summary, tags, date, neighbours.
+Fresh  : every note gets an age in days, a continuous freshness score in [0,1]
+         used for luminance/saturation/halo, and one of five bands used as
+         filters and labels (fresh/recent/settled/dormant/oxidized; `unknown`
+         only when no date can be found at all).
+Facts  : click any node for its summary, tags, dates, freshness and neighbours.
 
 Usage:
     python build_map.py <vault_dir> <out.html> [--title "My Brain"]
+                        [--as-of 2026-06-15] [--cytoscape-js path/to/cytoscape.min.js]
+                        [--strict-offline]
 
-No network at runtime: Cytoscape is inlined from a CDN fetch at build time if
-available, else loaded from CDN by the browser (the file still works online).
+Network honesty: by default the generated file loads Cytoscape from a pinned CDN
+URL and says so in its header ("Network runtime"). Nothing is ever downloaded at
+build time. Pass --cytoscape-js PATH to inline a Cytoscape bundle you already
+have, which makes the file work with no network at all ("Local runtime").
+--strict-offline refuses to write anything unless such a local bundle is given.
 """
 import os, re, sys, json, html, datetime, argparse, hashlib
 
@@ -21,6 +30,106 @@ try:
     import networkx as nx
 except ImportError:
     nx = None
+
+# ── runtime (Cytoscape) ──────────────────────────────────────────────────────
+CYTOSCAPE_CDN = "https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"
+# Official Cytoscape 3 browser bundles are hundreds of KiB. A generous lower
+# bound plus distribution-specific UMD/copyright markers rejects stubs, prose,
+# saved error pages and unrelated JavaScript without executing untrusted code.
+MIN_RUNTIME_BYTES = 100_000
+RUNTIME_SUFFIXES = (".js", ".mjs", ".cjs")
+RUNTIME_MARKERS = (
+    "The Cytoscape Consortium",
+    "module.exports=",
+    ".cytoscape=",
+)
+
+
+class RuntimeUnavailable(Exception):
+    """Raised when a local Cytoscape bundle is missing or implausible."""
+
+
+def read_local_runtime(path):
+    """Read and sanity-check a local Cytoscape bundle. Returns its JS source.
+
+    Never fetches anything: the file must already exist on disk. The checks are
+    deliberately cheap and non-executing — enough to refuse a stub, a saved error
+    page or a documentation file, so we never inline something that would leave a
+    silently broken map behind.
+    """
+    if not path:
+        raise RuntimeUnavailable("no path given")
+    if not os.path.isfile(path):
+        raise RuntimeUnavailable(f"no such file: {path}")
+    if not path.lower().endswith(RUNTIME_SUFFIXES):
+        raise RuntimeUnavailable(
+            f"{path} is not a {'/'.join(RUNTIME_SUFFIXES)} file — point this at a Cytoscape bundle")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError as exc:
+        raise RuntimeUnavailable(f"cannot read {path}: {exc}") from exc
+    if text.lstrip().startswith("<"):
+        raise RuntimeUnavailable(f"{path} looks like HTML, not a JavaScript bundle")
+    encoded_size = len(text.encode("utf-8"))
+    if encoded_size < MIN_RUNTIME_BYTES:
+        raise RuntimeUnavailable(
+            f"{path} is only {encoded_size} bytes — too small to be a Cytoscape browser bundle")
+    missing = [marker for marker in RUNTIME_MARKERS if marker not in text]
+    if missing:
+        raise RuntimeUnavailable(
+            f"{path} lacks official Cytoscape browser-bundle markers — wrong file?")
+    return text
+
+
+def escape_inline_js(text):
+    """Make arbitrary JS safe to embed inside a <script> element."""
+    text = re.sub(r"</(script)", lambda m: "<\\/" + m.group(1), text, flags=re.I)
+    return text.replace("<!--", "<\\!--")
+
+
+# ── freshness ────────────────────────────────────────────────────────────────
+# Exactly five bands, plus `unknown` for notes with no usable date at all.
+# Bands are for filtering and labelling; rendering uses the continuous score.
+FRESHNESS_BANDS = (
+    ("fresh",    7),      # updated within a week
+    ("recent",   30),     # 8–30 days
+    ("settled",  90),     # 31–90 days
+    ("dormant",  365),    # 91–365 days
+    ("oxidized", None),   # over a year
+)
+FRESHNESS_ORDER = tuple(name for name, _ in FRESHNESS_BANDS) + ("unknown",)
+# Score half-life: a note updated 120 days ago reads at half the luminance of a
+# brand new one. Exponential decay keeps the scale continuous and never reaches 0.
+FRESHNESS_HALF_LIFE_DAYS = 120.0
+
+
+def freshness_band(age_days):
+    """Map an age in days onto one of the five bands; None -> 'unknown'."""
+    if age_days is None:
+        return "unknown"
+    age = max(0, int(age_days))
+    for name, upper in FRESHNESS_BANDS:
+        if upper is None or age <= upper:
+            return name
+    return "oxidized"
+
+
+def freshness_score(age_days):
+    """Continuous freshness in [0,1]: 1.0 brand new, approaching 0 with age."""
+    if age_days is None:
+        return None
+    age = max(0, int(age_days))
+    return round(0.5 ** (age / FRESHNESS_HALF_LIFE_DAYS), 4)
+
+
+def freshness_for(updated, as_of):
+    """(band, age_days, score) for an ISO `updated` stamp against a reference."""
+    if not updated:
+        return "unknown", None, None
+    age = max(0, (as_of - datetime.datetime.fromisoformat(updated)).days)
+    return freshness_band(age), age, freshness_score(age)
+
 
 # ── theme + type taxonomy ────────────────────────────────────────────────────
 THEME_COLORS = {
@@ -61,15 +170,20 @@ def assign_theme_colors(theme_counts):
     return colors
 
 TYPE_SHAPES = {
-    "person":  "ellipse",
-    "meeting": "round-diamond",
-    "journal": "round-rectangle",
-    "todo":    "round-tag",
-    "index":   "star",
-    "project": "hexagon",
-    "lecture": "round-rectangle",
-    "link":    "round-pentagon",
-    "note":    "ellipse",
+    "person":      "ellipse",
+    "company":     "round-rectangle",
+    "project":     "hexagon",
+    "pattern":     "diamond",
+    "reflection":  "round-diamond",
+    "idea":        "star",
+    "atom":        "ellipse",
+    "meeting":     "round-diamond",
+    "journal":     "round-rectangle",
+    "todo":        "round-tag",
+    "index":       "star",
+    "lecture":     "round-rectangle",
+    "link":        "round-pentagon",
+    "note":        "ellipse",
 }
 
 def subtype_of(relpath, tags, title):
@@ -102,6 +216,32 @@ def parse_fm(block):
         fm[k] = v
     return fm
 
+def parse_timestamp(value):
+    """Normalize a frontmatter date to an ISO-8601 UTC timestamp, or empty."""
+    if not value:
+        return ""
+    try:
+        text = str(value).strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            parsed = datetime.datetime.fromisoformat(text).replace(tzinfo=datetime.timezone.utc)
+        else:
+            parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+            parsed = (parsed.replace(tzinfo=datetime.timezone.utc) if parsed.tzinfo is None
+                      else parsed.astimezone(datetime.timezone.utc))
+        return parsed.isoformat(timespec="seconds")
+    except ValueError:
+        return ""
+
+def parse_as_of(value):
+    """Parse --as-of into an aware datetime. Raises ValueError on garbage."""
+    parsed = parse_timestamp(value)
+    if not parsed:
+        raise ValueError(f"{value!r} is not an ISO date (2026-06-15) or timestamp")
+    return datetime.datetime.fromisoformat(parsed)
+
+# ── freshness field aliases ──────────────────────────────────────────────────
+UPDATED_FIELDS = ("last_updated", "updated", "modified")
+
 def summarize(body):
     """First non-empty prose under ## Summary, else first prose paragraph."""
     m = re.search(r"##\s*Summary\s*\n(.+?)(?:\n##\s|\Z)", body, re.S)
@@ -111,16 +251,39 @@ def summarize(body):
     text = " ".join(lines)
     return (text[:280] + "…") if len(text) > 280 else text
 
+def _link_key(value):
+    """Normalize a Markdown/GBrain link target without changing its identity."""
+    key = str(value).strip().replace("\\", "/")
+    if key.startswith("./"):
+        key = key[2:]
+    if key.lower().endswith(".md"):
+        key = key[:-3]
+    return key.strip("/")
+
+
 def load(vault):
     nodes = {}         # title -> node dict
-    raw_links = []     # (src_title, target_title_text)
-    by_title = {}
+    raw_links = []     # (src_title, target title/slug text)
+    aliases = {}       # title, filename and relative GBrain slug -> node id
+
+    def register(alias, node_id):
+        key = _link_key(alias)
+        if not key:
+            return
+        # Ambiguous aliases must not silently point at whichever file was read last.
+        existing = aliases.get(key)
+        if key not in aliases or existing == node_id:
+            aliases[key] = node_id
+        else:
+            aliases[key] = None
+
     for root, _, files in os.walk(vault):
         for fn in files:
             if not fn.endswith(".md"): continue
             path = os.path.join(root, fn)
             rel = os.path.relpath(path, vault)
-            text = open(path, encoding="utf-8").read()
+            with open(path, encoding="utf-8") as note_file:
+                text = note_file.read()
             fmm = FM_RE.match(text)
             fm = parse_fm(fmm.group(1)) if fmm else {}
             body = text[fmm.end():] if fmm else text
@@ -130,33 +293,54 @@ def load(vault):
             theme = parts[0] if len(parts) > 1 else "Other"  # top folder = theme; root notes = Other
             tags = fm.get("tags", [])
             if isinstance(tags, str): tags = [tags]
-            stype = subtype_of(rel, [t.lower() for t in tags], title)
-            created = fm.get("created", "")
+            fm_type = str(fm.get("type", "")).strip().lower()
+            stype = fm_type or subtype_of(rel, [t.lower() for t in tags], title)
+            created = parse_timestamp(fm.get("created", ""))
+            # freshness reads the first update-ish field present, then falls back
+            # to `created`, then to the file's own timestamp — so the inspector
+            # can always say *where* the date came from.
+            updated = ""
+            freshness_source = ""
+            for field in UPDATED_FIELDS:
+                updated = parse_timestamp(fm.get(field, ""))
+                if updated:
+                    freshness_source = field
+                    break
+            if not updated and created:
+                updated, freshness_source = created, "created"
             if not created:  # vanilla vaults often lack a date — fall back to the file's own timestamp
                 try:
                     st = os.stat(path)
                     ts = getattr(st, "st_birthtime", 0) or st.st_mtime
-                    created = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%S")
+                    created = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).isoformat(timespec="seconds")
+                    if not updated:
+                        updated, freshness_source = created, "filesystem"
                 except OSError:
                     created = ""
             if title in nodes:  # collision: keep first, skip dup title
                 title = f"{title} ⟨{hashlib.md5(rel.encode()).hexdigest()[:4]}⟩"
             nodes[title] = {
                 "id": title, "title": title, "theme": theme, "type": stype,
-                "tags": tags, "created": created, "summary": summarize(body),
+                "tags": tags, "created": created, "updated": updated,
+                "freshnessSource": freshness_source, "summary": summarize(body),
                 "path": rel, "source": fm.get("source", ""),
             }
-            by_title[title] = title
+            register(title, title)
+            register(os.path.splitext(fn)[0], title)
+            register(os.path.splitext(rel)[0], title)
             for tgt in WIKILINK_RE.findall(body):
                 raw_links.append((title, tgt.strip()))
-    # resolve links by exact title
+    # Resolve both ordinary title links and GBrain's relative slug links.
     edges = []
     seen = set()
-    for s, t in raw_links:
-        if t in nodes and s in nodes and s != t:
-            key = (s, t)
-            if key in seen: continue
-            seen.add(key); edges.append({"source": s, "target": t})
+    for source_id, target_text in raw_links:
+        target_id = aliases.get(_link_key(target_text))
+        if target_id and source_id in nodes and target_id != source_id:
+            key = (source_id, target_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append({"source": source_id, "target": target_id})
     return nodes, edges
 
 # ── layout ───────────────────────────────────────────────────────────────────
@@ -192,8 +376,9 @@ def layout(nodes, edges):
     return out
 
 # ── build payload ────────────────────────────────────────────────────────────
-def build(vault, title, source_label=None):
+def build(vault, title, source_label=None, as_of=None):
     nodes, edges = load(vault)
+    reference = parse_as_of(as_of) if as_of else datetime.datetime.now(datetime.timezone.utc)
     pos = layout(nodes, edges)
     use_preset = pos is not None
     deg = {nid: 0 for nid in nodes}
@@ -201,7 +386,11 @@ def build(vault, title, source_label=None):
         deg[e["source"]] += 1; deg[e["target"]] += 1
     cy_nodes = []
     for nid, n in nodes.items():
-        node = {"data": {**n, "deg": deg[nid], "size": 14 + min(deg[nid], 40) * 2.4}}
+        band, age_days, score = freshness_for(n["updated"], reference)
+        node = {"data": {**n, "deg": deg[nid], "orphan": deg[nid] == 0,
+                         "freshness": band, "ageDays": age_days,
+                         "freshnessScore": score,
+                         "size": 14 + min(deg[nid], 40) * 2.4}}
         if use_preset:
             x, y = pos[nid]
             node["position"] = {"x": round(x, 1), "y": round(y, 1)}
@@ -226,204 +415,417 @@ def build(vault, title, source_label=None):
     theme_colors = assign_theme_colors(themes)
     theme_order = sorted(themes, key=lambda t: (t == "Other", -themes[t], t.lower()))
     src_abs = os.path.abspath(vault)
-    parts = src_abs.split(os.sep)
-    short = (".../" + "/".join(parts[-3:])) if len(parts) > 4 else src_abs
+    safe_source = os.path.basename(os.path.normpath(src_abs)) or "notes"
+    freshness_counts = {band: 0 for band in FRESHNESS_ORDER}
+    for item in cy_nodes:
+        freshness_counts[item["data"]["freshness"]] += 1
+    flagged = sum(1 for item in cy_nodes
+                  if item["data"]["freshness"] == "oxidized" or item["data"]["orphan"])
+    audit = {"oxidized": freshness_counts["oxidized"],
+             "orphans": sum(1 for item in cy_nodes if item["data"]["orphan"]),
+             "flagged": flagged}
     return {
         "title": title, "nodes": cy_nodes, "edges": cy_edges,
-        "source": source_label or short, "sourceFull": src_abs,
+        "source": source_label or safe_source,
+        # Deliberately omit the absolute vault path: generated maps are often shared.
         "layout": "preset" if use_preset else "cose",
         "timeline": timeline, "themeColors": theme_colors, "themeOrder": theme_order,
-        "typeShapes": TYPE_SHAPES,
+        "typeShapes": TYPE_SHAPES, "freshnessOrder": list(FRESHNESS_ORDER),
+        "runtime": {"mode": "network", "label": "Network runtime", "source": CYTOSCAPE_CDN,
+                    "detail": "Cytoscape loads from a pinned CDN URL; your notes stay in this file."},
         "stats": {"nodes": len(nodes), "edges": len(edges),
                   "themes": themes, "types": types,
                   "span": [min((n["created"][:10] for n in nodes.values() if n["created"]), default=""),
-                           max((n["created"][:10] for n in nodes.values() if n["created"]), default="")]},
+                           max((n["created"][:10] for n in nodes.values() if n["created"]), default="")],
+                  "asOf": reference.isoformat(timespec="seconds"),
+                  "freshness": freshness_counts, "audit": audit},
     }
 
 # ── HTML ─────────────────────────────────────────────────────────────────────
-def render(payload):
-    data = json.dumps(payload, ensure_ascii=False)
-    return TEMPLATE.replace("/*__DATA__*/", data)
+def render(payload, runtime=None, runtime_path=None):
+    """Serialize the payload into the template.
+
+    `runtime` is the JS source of a local Cytoscape bundle (see
+    read_local_runtime); when given it is inlined and the file needs no network.
+    The runtime actually embedded is recorded on `payload["runtime"]` so the
+    header can state it honestly.
+    """
+    if runtime:
+        payload["runtime"] = {
+            "mode": "local", "label": "Local runtime",
+            "source": os.path.basename(runtime_path) if runtime_path else "inlined bundle",
+            "detail": "Cytoscape is inlined from a local bundle — this file needs no network.",
+        }
+        runtime_tag = "<script>\n" + escape_inline_js(runtime) + "\n</script>"
+    else:
+        payload["runtime"] = {
+            "mode": "network", "label": "Network runtime", "source": CYTOSCAPE_CDN,
+            "detail": "Cytoscape loads from a pinned CDN URL; your notes stay in this file.",
+        }
+        runtime_tag = f'<script src="{CYTOSCAPE_CDN}"></script>'
+    # "<" can only occur inside JSON string literals, so escaping it wholesale is
+    # safe and keeps note text from ever closing the <script> element.
+    data = json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c")
+    subs = {"<!--__RUNTIME__-->": runtime_tag, "/*__DATA__*/": data}
+    # one pass, so neither substitution can be rescanned for the other's marker
+    return re.sub(r"<!--__RUNTIME__-->|/\*__DATA__\*/", lambda m: subs[m.group(0)], TEMPLATE)
 
 TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Knowledge Map</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+<!--__RUNTIME__-->
 <style>
   :root{
-    --bg:#070b16; --panel:rgba(17,24,42,.82); --line:rgba(148,163,184,.14);
-    --ink:#e6edf6; --muted:#8aa0bd; --work:#38bdf8; --study:#a78bfa; --life:#fb923c;
+    /* dark graphite constellation — no coloured gradients, colour is data only */
+    --bg:#0a0c10; --surface:#13171d; --surface-2:#191e25;
+    --line:#242b34; --line-soft:#1d232b;
+    --ink:#e7ecf3; --ink-2:#bcc6d2; --muted:#7c8794; --muted-2:#5d6773;
+    --accent:#8ec3e0;        /* steel — focus, selection, active controls */
+    --warn:#d5a163;          /* audit + dormant */
+    --alert:#cd7361;         /* oxidized */
+    --r:12px; --r-sm:8px;
   }
   *{box-sizing:border-box}
-  html,body{margin:0;height:100%;background:
-     radial-gradient(1200px 800px at 20% -10%, rgba(56,189,248,.10), transparent 60%),
-     radial-gradient(1100px 700px at 100% 110%, rgba(167,139,250,.10), transparent 55%),
-     var(--bg); color:var(--ink);
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--ink);
      font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;
-     overflow:hidden}
-  #cy{position:fixed;inset:0}
-  .glass{background:var(--panel);backdrop-filter:blur(12px);
-     border:1px solid var(--line);border-radius:16px;
-     box-shadow:0 10px 40px rgba(0,0,0,.45)}
-  /* header */
-  #top{position:fixed;left:18px;top:18px;display:flex;gap:16px;align-items:center;
-     padding:12px 16px;z-index:7;max-width:calc(100vw - 36px)}
-  #top .grp{display:flex;flex-direction:column;gap:2px;min-width:0}
-  #top h1{font-size:15px;margin:0;letter-spacing:.3px;font-weight:650;white-space:nowrap}
-  #top .sub{color:var(--muted);font-size:12px;white-space:nowrap}
-  #top #src{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:11.5px;
-     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;max-width:46vw;overflow:hidden;
-     text-overflow:ellipsis;white-space:nowrap}
-  #top .vsep{width:1px;height:30px;background:var(--line)}
-  #top #counts{white-space:nowrap}
-  .chip{display:inline-flex;gap:6px;align-items:center;font-size:12px;color:var(--muted)}
-  .dot{width:9px;height:9px;border-radius:50%}
-  /* left controls */
-  #side{position:fixed;left:18px;top:86px;width:248px;padding:16px;z-index:6;
-     max-height:calc(100vh - 240px);display:flex;flex-direction:column;overflow:hidden}
-  .side-head{flex:0 0 auto}
-  .side-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;
-     margin:2px -6px 0 0;padding-right:6px}
-  #side h2{font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);
-     margin:2px 0 10px}
-  #search{width:100%;padding:9px 12px;border-radius:10px;border:1px solid var(--line);
-     background:rgba(2,6,18,.6);color:var(--ink);outline:none;font-size:13px}
-  #search:focus{border-color:rgba(56,189,248,.55)}
-  .filter{display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:9px;cursor:pointer;
-     user-select:none}
-  .filter:hover{background:rgba(148,163,184,.08)}
-  .filter .box{width:15px;height:15px;border-radius:4px;border:1px solid rgba(148,163,184,.5);
-     display:flex;align-items:center;justify-content:center;font-size:11px;color:#0b1020;
-     background:#cfe0f5;line-height:1}
-  .filter.off .box{background:transparent;color:transparent}
-  .filter.off{opacity:.5}
-  .filter .sw{width:11px;height:11px;border-radius:50%}
-  .filter .ct{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;font-size:12px}
-  .sec{margin-top:18px}
-  .btn{display:block;width:100%;margin-top:8px;padding:9px;border-radius:10px;border:1px solid var(--line);
-     background:rgba(2,6,18,.5);color:var(--ink);cursor:pointer;font-size:13px}
-  .btn:hover{border-color:rgba(167,139,250,.5)}
-  .btnrow{display:flex;gap:8px;margin-top:8px}
-  .btnrow .btn{flex:1;margin-top:0}
-  .iconbtn{flex:0 0 38px;width:38px;margin-top:0;padding:0;display:flex;align-items:center;justify-content:center;
-     border-radius:10px;border:1px solid var(--line);background:rgba(2,6,18,.5);color:var(--ink);cursor:pointer}
-  .iconbtn:hover{border-color:rgba(167,139,250,.5)}
-  .iconbtn.off{opacity:.4}
-  .iconbtn svg{width:16px;height:16px;display:block}
-  /* detail */
-  #detail{position:fixed;right:18px;top:86px;width:330px;padding:16px;z-index:6;display:none;
-     max-height:calc(100vh - 240px);overflow-y:auto;overscroll-behavior:contain}
-  .side-scroll::-webkit-scrollbar,#detail::-webkit-scrollbar{width:8px}
-  .side-scroll::-webkit-scrollbar-thumb,#detail::-webkit-scrollbar-thumb{
-     background:rgba(148,163,184,.28);border-radius:8px}
-  .side-scroll::-webkit-scrollbar-track,#detail::-webkit-scrollbar-track{background:transparent}
-  #detail .t{font-size:16px;font-weight:650;margin:0 0 4px;line-height:1.3}
-  #detail .meta{color:var(--muted);font-size:12px;margin-bottom:12px}
-  #detail .tags{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
-  #detail .tag{font-size:11px;padding:3px 8px;border-radius:999px;background:rgba(148,163,184,.12);
-     color:#cbd6e6}
-  #detail .sum{font-size:13px;color:#d4deec}
-  #detail .nb{margin-top:14px}
-  #detail .nb a{display:block;color:#9fc7ff;text-decoration:none;font-size:12.5px;
-     padding:4px 0;cursor:pointer}
-  #detail .nb a:hover{color:#cfe6ff}
-  #detail .close{position:absolute;right:14px;top:12px;color:var(--muted);cursor:pointer;font-size:18px}
-  /* timeline — full-width strip along the bottom; panels reserve room above it */
-  #tl{position:fixed;left:18px;right:18px;bottom:18px;height:120px;padding:12px 16px 4px;z-index:4}
-  #tl .head{display:flex;align-items:center;gap:14px;margin-bottom:0}
-  #tl .head .lab{font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted)}
-  #tl .play{cursor:pointer;border:1px solid var(--line);background:rgba(2,6,18,.5);color:var(--ink);
-     border-radius:8px;padding:5px 14px;font-size:12px}
-  #tl .play:hover{border-color:rgba(167,139,250,.6)}
-  #tl .read{margin-left:auto;display:flex;gap:14px;align-items:baseline}
-  #tl .read .now{color:var(--ink);font-size:13px;font-variant-numeric:tabular-nums}
-  #tl .read .tot{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
-  #tlchart{position:relative;width:100%;height:84px;cursor:ew-resize}
-  #tlsvg{width:100%;height:100%;display:block;touch-action:none}
-  #tltip{position:absolute;top:-2px;transform:translateX(-50%);pointer-events:none;display:none;
-     background:rgba(2,6,18,.94);border:1px solid var(--line);border-radius:8px;padding:6px 9px;
-     font-size:11px;white-space:nowrap;z-index:6;color:var(--ink)}
-  .hint{position:fixed;left:50%;bottom:150px;transform:translateX(-50%);color:var(--muted);
-     font-size:12px;z-index:4;pointer-events:none;opacity:.0;transition:opacity .4s}
+     -webkit-font-smoothing:antialiased}
+  /* faint star grid + neutral vignettes: constellation, not nebula */
+  #sky{position:fixed;inset:0;z-index:0;pointer-events:none;
+     background:
+       radial-gradient(circle at 1px 1px, rgba(198,212,230,.045) 1px, transparent 1.6px) 0 0/52px 52px,
+       radial-gradient(1100px 620px at 50% -12%, rgba(176,194,216,.055), transparent 62%),
+       radial-gradient(900px 520px at 96% 108%, rgba(140,160,184,.04), transparent 58%)}
+  #cy{position:fixed;inset:0;z-index:1}
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+     box-shadow:0 1px 0 rgba(255,255,255,.02) inset, 0 10px 30px rgba(0,0,0,.55)}
+  .eyebrow{font-size:10.5px;text-transform:uppercase;letter-spacing:.14em;color:var(--muted);
+     font-weight:600}
+  .vsep{width:1px;align-self:stretch;background:var(--line);flex:0 0 auto}
+  .h{display:none!important}
 
-  /* ── mobile / narrow ─────────────────────────────────────────────── */
-  @media (max-width: 860px){
-    #top{left:10px;right:10px;top:10px;padding:10px 12px;gap:12px}
-    #top h1{font-size:14px}
-    #top #src{max-width:42vw;font-size:10.5px}
-    #top .vsep,#top #counts{display:none}
-    #side{left:10px;top:66px;width:min(240px,56vw);padding:12px;max-height:40vh}
-    #detail{left:10px;right:10px;top:66px;width:auto;padding:12px;max-height:calc(100vh - 204px)}
-    #tl{left:10px;right:10px;bottom:10px;height:104px;padding:10px 12px 2px}
-    #tlchart{height:72px}
-    .hint{display:none}
+  /* ── top dock ─────────────────────────────────────────────────────────── */
+  #dock{position:fixed;left:16px;top:14px;z-index:7;display:flex;align-items:center;gap:14px;
+     padding:9px 14px;max-width:calc(100vw - 32px)}
+  #dock .ident{display:flex;flex-direction:column;gap:1px;min-width:0}
+  #dock h1{margin:0;font-size:14.5px;font-weight:650;letter-spacing:.2px;white-space:nowrap}
+  #dock .src{display:flex;align-items:center;gap:5px;color:var(--muted);font-size:11px;
+     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;max-width:38vw;overflow:hidden}
+  #dock .src span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #dock .src svg{width:11px;height:11px;flex:0 0 auto;opacity:.65}
+  .stat{display:flex;flex-direction:column;gap:1px;white-space:nowrap}
+  .stat b{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--ink)}
+  .stat i{font-style:normal;font-size:10px;text-transform:uppercase;letter-spacing:.11em;
+     color:var(--muted-2)}
+  #rt{display:flex;align-items:center;gap:7px;padding:5px 9px;border-radius:999px;
+     border:1px solid var(--line);background:var(--surface-2);white-space:nowrap}
+  #rt span.d{width:6px;height:6px;border-radius:50%;background:var(--warn);flex:0 0 auto}
+  #rt.local span.d{background:#6fbf9a}
+  #rt b{font-size:11px;font-weight:600;color:var(--ink-2)}
+
+  /* ── explore panel ────────────────────────────────────────────────────── */
+  #panel{position:fixed;left:16px;top:78px;width:252px;z-index:6;padding:13px 13px 9px;
+     max-height:calc(100vh - 250px);display:flex;flex-direction:column;overflow:hidden}
+  #panel .p-head{flex:0 0 auto}
+  #panel .p-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px}
+  .minbtn{width:22px;height:22px;padding:0;display:flex;align-items:center;justify-content:center;
+     border:1px solid transparent;border-radius:6px;background:none;color:var(--muted);cursor:pointer}
+  .minbtn:hover{color:var(--ink);border-color:var(--line)}
+  .minbtn svg{width:13px;height:13px;transition:transform .18s ease}
+  #panel.min .minbtn svg{transform:rotate(-90deg)}
+  #panel.min .p-body,#panel.min .tools,#panel.min .note{display:none}
+  .searchwrap{position:relative;display:flex;align-items:center}
+  .searchwrap .s-ico{position:absolute;left:10px;width:13px;height:13px;color:var(--muted-2);
+     pointer-events:none}
+  #search{width:100%;padding:8px 52px 8px 30px;border-radius:var(--r-sm);border:1px solid var(--line);
+     background:#0d1117;color:var(--ink);outline:none;font-size:13px;appearance:none}
+  #search::placeholder{color:var(--muted-2)}
+  #search:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(142,195,224,.12)}
+  #search::-webkit-search-cancel-button{filter:invert(.6)}
+  .kbd{position:absolute;right:8px;padding:2px 5px;border:1px solid var(--line);border-radius:5px;
+     background:var(--surface-2);color:var(--muted);font:10.5px ui-monospace,monospace;
+     pointer-events:none}
+  .tools{display:flex;gap:6px;margin-top:9px}
+  .tool{flex:1;padding:7px 6px;border-radius:var(--r-sm);border:1px solid var(--line);
+     background:var(--surface-2);color:var(--ink-2);cursor:pointer;font-size:12px;font-weight:550;
+     display:flex;align-items:center;justify-content:center;gap:5px;white-space:nowrap}
+  .tool:hover{border-color:#33404e;color:var(--ink)}
+  .tool:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .tool[aria-pressed="false"]{color:var(--muted-2)}
+  .tool.on{border-color:var(--accent);color:#0c1016;background:var(--accent)}
+  .tool.audit.on{border-color:var(--warn);background:var(--warn);color:#17120a}
+  .badge{font-variant-numeric:tabular-nums;font-size:10.5px;padding:1px 4px;border-radius:4px;
+     background:rgba(255,255,255,.1);color:inherit}
+  .tool.audit.on .badge{background:rgba(0,0,0,.18)}
+  .note{margin:9px 0 0;padding:7px 9px;border-radius:var(--r-sm);border:1px solid rgba(213,161,99,.32);
+     background:rgba(213,161,99,.08);color:#e7cba0;font-size:11.5px;line-height:1.45}
+  .note b{color:#f2dcb8;font-variant-numeric:tabular-nums}
+  .p-body{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;
+     margin:12px -5px 0 0;padding-right:5px}
+  .grp{border-top:1px solid var(--line-soft)}
+  .grp:first-child{border-top:none}
+  .grp>summary{display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;
+     padding:9px 2px}
+  .grp>summary::-webkit-details-marker{display:none}
+  .grp>summary:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;border-radius:6px}
+  .chev{width:11px;height:11px;color:var(--muted-2);transition:transform .18s ease;flex:0 0 auto}
+  .grp[open]>summary .chev{transform:rotate(90deg)}
+  .grp>summary .ct{margin-left:auto;color:var(--muted-2);font-size:11px;
+     font-variant-numeric:tabular-nums}
+  .rows{padding:0 0 8px}
+  .filter{display:flex;align-items:center;gap:8px;padding:5px 7px;border-radius:7px;cursor:pointer;
+     user-select:none}
+  .filter:hover{background:rgba(190,208,230,.055)}
+  .filter .box{width:14px;height:14px;border-radius:4px;border:1px solid #3a4450;flex:0 0 auto;
+     display:flex;align-items:center;justify-content:center;background:#c9d7e6}
+  .filter .box svg{width:10px;height:10px;color:#0c1016}
+  .filter.off .box{background:transparent}
+  .filter.off .box svg{display:none}
+  .filter.off{opacity:.45}
+  .filter .sw{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+  .filter .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px}
+  .filter .ct{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;font-size:11.5px}
+
+  /* ── inspector ────────────────────────────────────────────────────────── */
+  #insp{position:fixed;right:16px;top:78px;width:326px;z-index:6;padding:15px;
+     max-height:calc(100vh - 250px);overflow-y:auto;overscroll-behavior:contain}
+  #insp[hidden]{display:none}
+  .p-body::-webkit-scrollbar,#insp::-webkit-scrollbar{width:8px}
+  .p-body::-webkit-scrollbar-thumb,#insp::-webkit-scrollbar-thumb{background:#2b333d;border-radius:8px}
+  .p-body::-webkit-scrollbar-track,#insp::-webkit-scrollbar-track{background:transparent}
+  #insp .close{position:absolute;right:11px;top:11px;width:24px;height:24px;padding:0;display:flex;
+     align-items:center;justify-content:center;border:1px solid transparent;border-radius:6px;
+     background:none;color:var(--muted);cursor:pointer}
+  #insp .close:hover{color:var(--ink);border-color:var(--line)}
+  #insp .close svg{width:12px;height:12px}
+  #iTitle{margin:6px 34px 8px 0;font-size:15.5px;font-weight:650;line-height:1.32}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:999px;
+     border:1px solid var(--line);background:var(--surface-2);font-size:11px;color:var(--ink-2)}
+  .chip .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+  .meter{height:3px;border-radius:3px;background:#20262e;overflow:hidden;margin:0 0 12px}
+  .meter i{display:block;height:100%;border-radius:3px;background:var(--accent)}
+  .facts{display:grid;grid-template-columns:auto 1fr;gap:5px 12px;margin:0 0 14px;font-size:12px}
+  .facts dt{color:var(--muted);white-space:nowrap}
+  .facts dd{margin:0;color:var(--ink-2);overflow-wrap:anywhere}
+  .facts dd.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;
+     color:var(--muted)}
+  .facts dd[data-tone="fresh"]{color:#e8eef7}
+  .facts dd[data-tone="recent"]{color:#c3d0de}
+  .facts dd[data-tone="settled"]{color:#9fadbe}
+  .facts dd[data-tone="dormant"]{color:var(--warn)}
+  .facts dd[data-tone="oxidized"]{color:var(--alert)}
+  .facts dd[data-tone="unknown"]{color:var(--muted-2)}
+  .facts dd[data-tone="flag"]{color:var(--warn)}
+  .isec{border-top:1px solid var(--line-soft);padding-top:11px;margin-top:11px}
+  .isec .eyebrow{display:block;margin-bottom:6px}
+  #iSummary{margin:0;font-size:12.5px;line-height:1.55;color:var(--ink-2)}
+  .tags{display:flex;flex-wrap:wrap;gap:5px}
+  .tag{font-size:10.5px;padding:2px 7px;border-radius:999px;background:#1e242c;color:#a9b6c5}
+  .nb a{display:flex;align-items:center;gap:7px;padding:4px 0;color:#a8c9e4;font-size:12.5px;
+     text-decoration:none;cursor:pointer}
+  .nb a:hover{color:#d5e7f7}
+  .nb a .dot{width:6px;height:6px;border-radius:50%;flex:0 0 auto}
+  .nb a span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .nb .more{color:var(--muted-2);font-size:11px;padding-top:4px}
+
+  /* ── timeline ─────────────────────────────────────────────────────────── */
+  #tl{position:fixed;left:16px;right:16px;bottom:16px;height:118px;padding:11px 15px 3px;z-index:4}
+  #tl .head{display:flex;align-items:center;gap:13px}
+  #tl .play{display:flex;align-items:center;gap:6px;cursor:pointer;border:1px solid var(--line);
+     background:var(--surface-2);color:var(--ink-2);border-radius:var(--r-sm);padding:5px 11px;
+     font-size:12px;font-weight:550}
+  #tl .play:hover{border-color:#33404e;color:var(--ink)}
+  #tl .play svg{width:11px;height:11px}
+  #tl .read{margin-left:auto;display:flex;gap:12px;align-items:baseline}
+  #tl .read .now{font-size:12.5px;font-variant-numeric:tabular-nums;color:var(--ink)}
+  #tl .read .tot{font-size:11.5px;font-variant-numeric:tabular-nums;color:var(--muted)}
+  #tlchart{position:relative;width:100%;height:82px;cursor:ew-resize}
+  #tlsvg{width:100%;height:100%;display:block;touch-action:none}
+  #tltip{position:absolute;top:-4px;transform:translateX(-50%);pointer-events:none;display:none;
+     background:#0d1117;border:1px solid var(--line);border-radius:var(--r-sm);padding:7px 9px;
+     font-size:11px;white-space:nowrap;z-index:6;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+  #tltip .tt-h{font-weight:600;margin-bottom:4px;font-variant-numeric:tabular-nums}
+  #tltip .tt-r{display:flex;align-items:center;gap:6px;color:var(--ink-2)}
+  #tltip .tt-r i{width:7px;height:7px;border-radius:50%}
+  #tltip .tt-r b{margin-left:auto;font-variant-numeric:tabular-nums;font-weight:600}
+  #hint{position:fixed;left:50%;bottom:148px;transform:translateX(-50%);color:var(--muted);
+     font-size:11.5px;z-index:4;pointer-events:none;opacity:0;transition:opacity .5s ease}
+  #hint.show{opacity:1}
+
+  /* ── responsive ───────────────────────────────────────────────────────── */
+  @media (max-width: 980px){
+    #dock{left:10px;right:10px;top:10px;gap:11px;padding:8px 11px}
+    #dock .src{max-width:34vw}
+    #panel{left:10px;top:72px;width:min(238px,54vw);max-height:42vh;padding:11px}
+    #insp{left:10px;right:10px;top:auto;bottom:146px;width:auto;max-height:44vh;padding:13px}
+    #tl{left:10px;right:10px;bottom:10px;height:108px;padding:10px 12px 2px}
+    #tlchart{height:74px}
+    #hint{display:none}
   }
-  @media (max-width: 520px){
-    #top #src{display:none}
-    #side{width:64vw}
-    #tl .head .lab{display:none}
+  @media (max-width: 680px){
+    #dock .src,#dock .vsep,#dock .stat.opt{display:none}
+    #panel{width:64vw}
+    #tl .head .eyebrow{display:none}
+  }
+  @media (prefers-reduced-motion: reduce){
+    *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;
+      transition-duration:.01ms!important;scroll-behavior:auto!important}
   }
 </style></head>
 <body>
-<div id="cy"></div>
+<div id="sky"></div>
+<div id="cy" role="application" aria-label="Knowledge constellation"></div>
 
-<div id="top" class="glass">
-  <div class="grp">
+<header id="dock" class="panel">
+  <div class="ident">
     <h1 id="ttl">Knowledge Map</h1>
-    <div id="src"></div>
-  </div>
-  <span class="vsep"></span>
-  <span class="sub" id="counts"></span>
-</div>
-
-<div id="side" class="glass">
-  <div class="side-head">
-    <h2>Search</h2>
-    <input id="search" placeholder="Filter nodes…" autocomplete="off">
-    <div class="btnrow">
-      <button class="btn" id="fit">Reset view</button>
-      <button class="iconbtn" id="toggleEdges" title="Toggle links" aria-label="Toggle links">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="12" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="18" cy="18" r="2.4"/><line x1="8.2" y1="10.9" x2="15.8" y2="7.1"/><line x1="8.2" y1="13.1" x2="15.8" y2="16.9"/></svg>
-      </button>
+    <div class="src">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 7.5V18a1.5 1.5 0 001.5 1.5h15A1.5 1.5 0 0021 18V9a1.5 1.5 0 00-1.5-1.5h-7L10 5H4.5A1.5 1.5 0 003 6.5z"/></svg>
+      <span id="srcTxt"></span>
     </div>
   </div>
-  <div class="side-scroll">
-    <div class="sec"><h2>Themes</h2><div id="themeFilters"></div></div>
-    <div class="sec"><h2>Types</h2><div id="typeFilters"></div></div>
+  <span class="vsep"></span>
+  <div class="stat"><b id="cShown">—</b><i>notes shown</i></div>
+  <div class="stat opt"><b id="cLinks">—</b><i>links</i></div>
+  <div class="stat opt"><b id="cSpan">—</b><i id="cAsOf">span</i></div>
+  <span class="vsep"></span>
+  <div id="rt"><span class="d"></span><b id="rtLabel"></b></div>
+</header>
+
+<section id="panel" class="panel" aria-label="Explore controls">
+  <div class="p-head">
+    <div class="p-title">
+      <span class="eyebrow">Explore</span>
+      <button class="minbtn" id="panelMin" aria-expanded="true" aria-controls="panelBody" title="Collapse controls">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+    </div>
+    <div class="searchwrap">
+      <svg class="s-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+      <input id="search" type="search" placeholder="Search notes and tags" aria-label="Search notes and tags" autocomplete="off" spellcheck="false">
+      <kbd class="kbd" id="kbd">Ctrl K</kbd>
+    </div>
+    <div class="tools">
+      <button class="tool" id="fit" title="Fit the whole constellation">Reset</button>
+      <button class="tool on" id="toggleEdges" aria-pressed="true" title="Show or hide links">Links</button>
+      <button class="tool audit" id="audit" aria-pressed="false" title="Isolate oxidized and orphan notes">Audit <span class="badge" id="auditCt">0</span></button>
+    </div>
+    <p class="note" id="auditNote" role="status" hidden></p>
   </div>
-</div>
+  <div class="p-body" id="panelBody">
+    <details class="grp" id="grpThemes" open>
+      <summary>
+        <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+        <span class="eyebrow">Themes</span><span class="ct" id="ctThemes"></span>
+      </summary>
+      <div class="rows" id="themeFilters"></div>
+    </details>
+    <details class="grp" id="grpTypes">
+      <summary>
+        <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+        <span class="eyebrow">Types</span><span class="ct" id="ctTypes"></span>
+      </summary>
+      <div class="rows" id="typeFilters"></div>
+    </details>
+    <details class="grp" id="grpFresh" open>
+      <summary>
+        <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+        <span class="eyebrow">Freshness</span><span class="ct" id="ctFresh"></span>
+      </summary>
+      <div class="rows" id="freshFilters"></div>
+    </details>
+  </div>
+</section>
 
-<div id="detail" class="glass">
-  <span class="close" id="dClose">×</span>
-  <p class="t" id="dT"></p>
-  <div class="meta" id="dM"></div>
-  <div class="tags" id="dTags"></div>
-  <div class="sum" id="dS"></div>
-  <div class="nb" id="dNb"></div>
-</div>
+<aside id="insp" class="panel" aria-live="polite" hidden>
+  <button class="close" id="inspClose" aria-label="Close inspector">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+  </button>
+  <span class="eyebrow">Note</span>
+  <h2 id="iTitle"></h2>
+  <div class="chips" id="iChips"></div>
+  <div class="meter" title="Continuous freshness score"><i id="iMeter"></i></div>
+  <dl class="facts" id="iFacts"></dl>
+  <div class="isec"><span class="eyebrow">Summary</span><p id="iSummary"></p></div>
+  <div class="isec" id="iTagsSec"><span class="eyebrow">Tags</span><div class="tags" id="iTags"></div></div>
+  <div class="isec" id="iLinksSec"><span class="eyebrow" id="iLinksHead">Connected</span><div class="nb" id="iLinks"></div></div>
+</aside>
 
-<div id="tl" class="glass">
+<footer id="tl" class="panel">
   <div class="head">
-    <span class="lab">Timeline — cumulative</span>
-    <button class="play" id="play">▶ Play growth</button>
+    <span class="eyebrow">Timeline &middot; cumulative</span>
+    <button class="play" id="play" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="currentColor" id="icPlay"><path d="M8 5l12 7-12 7z"/></svg>
+      <svg viewBox="0 0 24 24" fill="currentColor" id="icPause" class="h"><path d="M7 5h4v14H7zm6 0h4v14h-4z"/></svg>
+      <span id="playLab">Play growth</span>
+    </button>
     <span class="read"><span class="now" id="now"></span><span class="tot" id="tot"></span></span>
   </div>
   <div id="tlchart"><svg id="tlsvg"></svg><div id="tltip"></div></div>
-</div>
-<div class="hint" id="hint">drag the timeline to travel through time · ▶ Play to watch it grow</div>
+</footer>
+<div id="hint">drag the timeline to travel through time &middot; click a node to inspect it</div>
 
 <script>
 const DATA = /*__DATA__*/;
 const TC = DATA.themeColors;
-document.getElementById('ttl').textContent = DATA.title;
-const srcEl = document.getElementById('src');
-srcEl.innerHTML = `<span style="opacity:.7">🗄</span> ${DATA.source}`;
-srcEl.title = DATA.sourceFull || DATA.source;
-document.getElementById('counts').innerHTML =
-  `<span class="sub">${DATA.stats.nodes} notes · ${DATA.stats.edges} links · ${DATA.stats.span[0]} → ${DATA.stats.span[1]}</span>`;
+const REDUCED = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const DUR = REDUCED ? 0 : 300;
+const $ = id => document.getElementById(id);
 
-// ---- Cytoscape ----
+// ---- freshness vocabulary (bands label + filter; the score drives rendering) --
+const BANDS = {
+  fresh:    {label:'Fresh',    hint:'updated within 7 days', color:'#e8eef7'},
+  recent:   {label:'Recent',   hint:'8 to 30 days',          color:'#bcc9d8'},
+  settled:  {label:'Settled',  hint:'31 to 90 days',         color:'#93a2b5'},
+  dormant:  {label:'Dormant',  hint:'91 to 365 days',        color:'#d5a163'},
+  oxidized: {label:'Oxidized', hint:'over a year old',       color:'#cd7361'},
+  unknown:  {label:'Unknown',  hint:'no usable date',        color:'#5d6773'}
+};
+const BAND_ORDER = DATA.freshnessOrder || Object.keys(BANDS);
+const SOURCE_LABEL = {
+  last_updated:'frontmatter last_updated', updated:'frontmatter updated',
+  modified:'frontmatter modified', created:'frontmatter created (no update field)',
+  filesystem:'file timestamp (no date in frontmatter)'
+};
+
+// ---- header ----
+$('ttl').textContent = DATA.title;
+$('srcTxt').textContent = DATA.source;
+$('srcTxt').title = DATA.source;
+$('cLinks').textContent = DATA.stats.edges;
+const SPAN = DATA.stats.span;
+$('cSpan').textContent = (SPAN[0] && SPAN[1]) ? SPAN[0] + ' to ' + SPAN[1] : 'undated';
+$('cAsOf').textContent = 'as of ' + (DATA.stats.asOf || '').slice(0,10);
+const RT = DATA.runtime || {mode:'network', label:'Network runtime'};
+$('rtLabel').textContent = RT.label;
+$('rt').classList.toggle('local', RT.mode === 'local');
+$('rt').title = RT.detail ? RT.detail + ' (' + RT.source + ')' : RT.source || '';
+$('kbd').textContent = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? '⌘ K' : 'Ctrl K';
+
+// ---- continuous freshness -> colour/luminance/halo ----
+const GRAPHITE = [0x6b, 0x74, 0x80];
+function themeColor(t){ return TC[t] || TC.Other || '#8b96a5'; }
+function rgbOf(hex){
+  let h = String(hex).replace('#','');
+  if(h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+  const v = parseInt(h, 16) || 0;
+  return [(v>>16)&255, (v>>8)&255, v&255];
+}
+function toward(hex, t){                       // t=0 keep hue, t=1 flat graphite
+  const c = rgbOf(hex);
+  return 'rgb(' + c.map((v,i)=>Math.round(v + (GRAPHITE[i]-v)*t)).join(',') + ')';
+}
+// nodes with no date at all sit low but not at zero, so they stay findable
+const FS = n => { const s = n.data('freshnessScore'); return typeof s === 'number' ? s : 0.22; };
+const colorCache = {};
+function nodeColor(n){
+  const step = Math.round(FS(n) * 16);
+  const key = n.data('theme') + '|' + step;
+  if(!(key in colorCache)) colorCache[key] = toward(themeColor(n.data('theme')), 0.62*(1 - step/16));
+  return colorCache[key];
+}
+
 function layoutOpts(){
   if(DATA.layout === 'cose'){
     return { name:'cose', animate:false, randomize:true, fit:true, padding:70,
@@ -433,7 +835,7 @@ function layoutOpts(){
   return { name:'preset' };
 }
 const cy = cytoscape({
-  container: document.getElementById('cy'),
+  container: $('cy'),
   elements: { nodes: DATA.nodes, edges: DATA.edges },
   layout: layoutOpts(),
   wheelSensitivity: 0.22,
@@ -441,232 +843,495 @@ const cy = cytoscape({
   style: [
     { selector:'node', style:{
         'width':'data(size)','height':'data(size)',
-        'background-color': n => TC[n.data('theme')]||TC.Other,
         'shape': n => DATA.typeShapes[n.data('type')] || 'ellipse',
-        'border-width':0, 'label':'', 'background-opacity':0.95,
-        'shadow-blur':14,'shadow-color': n => TC[n.data('theme')]||TC.Other,
-        'shadow-opacity':0.55,'shadow-offset-x':0,'shadow-offset-y':0,
-        'transition-property':'opacity,width,height','transition-duration':'140ms'
+        'background-color': nodeColor,                                  // saturation falls with age
+        'background-opacity': n => 0.40 + 0.58*FS(n),                   // luminance falls with age
+        'background-blacken': n => 0.34*(1 - FS(n)),
+        'underlay-color': n => themeColor(n.data('theme')),             // halo only for fresh notes
+        'underlay-shape':'ellipse',
+        'underlay-padding': n => 1 + 9*Math.pow(FS(n), 1.6),
+        'underlay-opacity': n => 0.03 + 0.26*Math.pow(FS(n), 2),
+        'border-width': n => n.data('freshness') === 'unknown' ? 1 : 0,
+        'border-color':'#3c4653','border-style':'dashed','border-opacity':0.9,
+        'label':'','transition-property':'opacity','transition-duration':'120ms'
     }},
-    { selector:'node.hub', style:{ 'label':'data(title)','color':'#dfe9f6','font-size':11,
-        'text-outline-width':2,'text-outline-color':'#070b16','text-max-width':120,
-        'text-wrap':'ellipsis' } },
-    { selector:'edge', style:{
-        'width':1,'curve-style':'straight','opacity':0.20,
-        'line-color': e => TC[e.data('theme')]||TC.Other }},
+    // semantic hierarchy: hubs always named, mid-degree names appear when you zoom in
+    { selector:'node.hub', style:{ 'label':'data(title)','color':'#cdd8e6','font-size':11,
+        'font-weight':600,'text-outline-width':2.4,'text-outline-color':'#0a0c10',
+        'text-max-width':126,'text-wrap':'ellipsis','min-zoomed-font-size':7 }},
+    { selector:'node.lab', style:{ 'label':'data(title)','color':'#9fabba','font-size':9.5,
+        'text-outline-width':2,'text-outline-color':'#0a0c10','text-max-width':104,
+        'text-wrap':'ellipsis','min-zoomed-font-size':8 }},
+    { selector:'edge', style:{                                          // quiet by default
+        'width':0.8,'curve-style':'straight','opacity':0.12,'line-color':'#63707e' }},
     { selector:'.dim', style:{ 'opacity':0.05 }},
-    { selector:'.hl', style:{ 'opacity':1,'label':'data(title)','color':'#fff','font-size':12,
-        'text-outline-width':2,'text-outline-color':'#070b16','z-index':99 }},
-    { selector:'edge.hl', style:{ 'opacity':0.9,'width':2 }},
-    { selector:'.hidden', style:{ 'display':'none' }},
-    { selector:'node.search', style:{ 'border-width':3,'border-color':'#fff' }},
+    { selector:'node.hl', style:{ 'opacity':1,'label':'data(title)','color':'#e7ecf3','font-size':11.5,
+        'text-outline-width':0,'text-background-color':'#0a0c10','text-background-opacity':0.82,
+        'text-background-padding':3,'text-background-shape':'roundrectangle','z-index':50,
+        'min-zoomed-font-size':0 }},
+    { selector:'edge.hl', style:{ 'opacity':0.7,'width':1.5,
+        'line-color': e => themeColor(e.data('theme')) }},
+    // the selected node reads at full strength whatever its age
+    { selector:'node.sel', style:{ 'background-color': n => themeColor(n.data('theme')),
+        'background-opacity':1,'background-blacken':0,
+        'border-width':2,'border-color':'#f1f5fa','border-style':'solid','border-opacity':1,
+        'underlay-opacity':0.34,'underlay-padding':9,
+        'label':'data(title)','color':'#ffffff','font-size':13,'font-weight':650,
+        'text-background-color':'#0a0c10','text-background-opacity':0.9,'text-background-padding':4,
+        'text-background-shape':'roundrectangle','text-max-width':180,'text-wrap':'wrap',
+        'z-index':99,'min-zoomed-font-size':0 }},
+    { selector:'node.search', style:{ 'border-width':2.5,'border-color':'#f1f5fa','border-style':'solid',
+        'border-opacity':1,'z-index':40 }},
+    // audit lens: only while Audit is active, so bands never colour the default view
+    { selector:'node.flag', style:{ 'border-width':2,'border-color':'#d5a163','border-style':'solid',
+        'border-opacity':1 }},
+    { selector:'node.flag.oxid', style:{ 'border-color':'#cd7361' }},
+    { selector:'.hidden', style:{ 'display':'none' }}
   ]
 });
 
-// label only well-connected hubs
-cy.nodes().forEach(n => { if (n.data('deg') >= 7) n.addClass('hub'); });
+cy.nodes().forEach(n => {
+  const d = n.data('deg');
+  if(d >= 7) n.addClass('hub'); else if(d >= 3) n.addClass('mid');
+});
+let wideLabels = false;
+cy.on('zoom', () => {
+  const on = cy.zoom() > 1.2;
+  if(on === wideLabels) return;
+  wideLabels = on;
+  cy.batch(() => cy.nodes('.mid').toggleClass('lab', on));
+});
 
-// ---- filters state ----
-const themeOn = {}, typeOn = {};
-Object.keys(DATA.stats.themes).forEach(t=>themeOn[t]=true);
-Object.keys(DATA.stats.types).forEach(t=>typeOn[t]=true);
-let cutoff = 1.0; // timeline fraction
-let edgesVisible = true;
+// ---- filter state ----
+const themeOn = {}, typeOn = {}, freshOn = {};
+Object.keys(DATA.stats.themes).forEach(t => themeOn[t] = true);
+Object.keys(DATA.stats.types).forEach(t => typeOn[t] = true);
+BAND_ORDER.forEach(b => freshOn[b] = true);
+let auditOn = false, edgesVisible = true, cutoff = 1.0;
+const syncers = [];
 
-function buildFilters(el, counts, state, colorize){
-  const box = document.getElementById(el);
-  Object.entries(counts).sort((a,b)=>b[1]-a[1]).forEach(([k,v])=>{
-    const row=document.createElement('div'); row.className='filter';
-    const bx=document.createElement('span'); bx.className='box';
-    const sw=document.createElement('span'); sw.className='sw';
-    sw.style.background = colorize? (TC[k]||TC.Other) : 'rgba(148,163,184,.55)';
-    const tx=document.createElement('span'); tx.className='nm'; tx.textContent=k;
-    const ct=document.createElement('span'); ct.className='ct'; ct.textContent=v;
-    row.append(bx,sw,tx,ct); box.append(row);
-    const sync=()=>{ row.classList.toggle('off',!state[k]); bx.textContent=state[k]?'✓':''; };
-    row.onclick=()=>{ state[k]=!state[k]; sync(); apply(); };
+function checkMark(){
+  const s = document.createElementNS('http://www.w3.org/2000/svg','svg');
+  s.setAttribute('viewBox','0 0 24 24'); s.setAttribute('fill','none');
+  s.setAttribute('stroke','currentColor'); s.setAttribute('stroke-width','3.4');
+  s.setAttribute('stroke-linecap','round'); s.setAttribute('stroke-linejoin','round');
+  const p = document.createElementNS('http://www.w3.org/2000/svg','path');
+  p.setAttribute('d','M5 13l4.5 4.5L19 7'); s.append(p);
+  return s;
+}
+function buildFilters(elId, entries, state){
+  const box = $(elId);
+  entries.forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'filter'; row.tabIndex = 0; row.setAttribute('role','checkbox');
+    if(item.hint) row.title = item.label + ' — ' + item.hint;
+    const bx = document.createElement('span'); bx.className = 'box'; bx.append(checkMark());
+    const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = item.color;
+    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = item.label;
+    const ct = document.createElement('span'); ct.className = 'ct'; ct.textContent = item.count;
+    row.append(bx, sw, nm, ct); box.append(row);
+    const sync = () => { const on = !!state[item.key];
+      row.classList.toggle('off', !on); row.setAttribute('aria-checked', String(on)); };
+    const toggle = () => { state[item.key] = !state[item.key]; sync(); apply(); };
+    row.onclick = toggle;
+    row.onkeydown = e => { if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); toggle(); } };
+    syncers.push(sync);
     sync();
   });
 }
-buildFilters('themeFilters', DATA.stats.themes, themeOn, true);
-buildFilters('typeFilters', DATA.stats.types, typeOn, false);
+const themeEntries = (DATA.themeOrder || Object.keys(DATA.stats.themes))
+  .filter(t => DATA.stats.themes[t])
+  .map(t => ({key:t, label:t, count:DATA.stats.themes[t], color:themeColor(t)}));
+const typeEntries = Object.keys(DATA.stats.types)
+  .sort((a,b) => DATA.stats.types[b] - DATA.stats.types[a] || a.localeCompare(b))
+  .map(t => ({key:t, label:t, count:DATA.stats.types[t], color:'#4d5865'}));
+const freshEntries = BAND_ORDER
+  .filter(b => (DATA.stats.freshness || {})[b])
+  .map(b => ({key:b, label:BANDS[b].label, hint:BANDS[b].hint,
+              count:DATA.stats.freshness[b], color:BANDS[b].color}));
+buildFilters('themeFilters', themeEntries, themeOn);
+buildFilters('typeFilters', typeEntries, typeOn);
+buildFilters('freshFilters', freshEntries, freshOn);
+
+function groupCount(el, entries, state){
+  const on = entries.filter(e => state[e.key]).length;
+  $(el).textContent = on + '/' + entries.length;
+}
 
 // ---- timeline (cumulative growth, SVG) ----
-const months = DATA.timeline.map(m=>m.month);
-function cutoffMonth(){ const idx=Math.max(0,Math.ceil(cutoff*months.length)-1); return months[idx]||months[months.length-1]; }
-
+const months = DATA.timeline.map(m => m.month);
+function cutoffMonth(){
+  const idx = Math.max(0, Math.ceil(cutoff*months.length) - 1);
+  return months[idx] || months[months.length-1] || '';
+}
 const TL_ORDER = DATA.themeOrder || Object.keys(DATA.themeColors);
-const MN=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-const chart=document.getElementById('tlchart');
-const svg=document.getElementById('tlsvg');
-const tip=document.getElementById('tltip');
-let TLG=null;
-function shortMonth(ym){ const [y,m]=ym.split('-'); return (MN[(+m)-1]||m)+" '"+y.slice(2); }
+const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const chart = $('tlchart'), svg = $('tlsvg'), tip = $('tltip');
+let TLG = null;
+function shortMonth(ym){ const p = String(ym).split('-'); return (MN[(+p[1])-1] || p[1]) + " '" + String(p[0]).slice(2); }
 
 function buildTimeline(){
-  const PAD={l:14,r:14,t:14,b:20};
-  const w=chart.clientWidth||900, h=chart.clientHeight||98;
-  const iw=w-PAD.l-PAD.r, ih=h-PAD.t-PAD.b, n=DATA.timeline.length;
-  let cum={}; TL_ORDER.forEach(t=>cum[t]=0);
-  const pts=DATA.timeline.map(m=>{ TL_ORDER.forEach(t=>cum[t]+=m[t]||0); return Object.assign({},cum); });
-  const total=TL_ORDER.reduce((s,t)=>s+cum[t],0)||1;
-  const X=i=> PAD.l + (n>1? i/(n-1):0)*iw;
-  const Y=v=> PAD.t + ih - v/total*ih;
+  const PAD = {l:14, r:14, t:13, b:19};
+  const w = chart.clientWidth || 900, h = chart.clientHeight || 96;
+  const iw = w-PAD.l-PAD.r, ih = h-PAD.t-PAD.b, n = DATA.timeline.length;
+  if(!n){ TLG = null; return; }
+  const cum = {}; TL_ORDER.forEach(t => cum[t] = 0);
+  const pts = DATA.timeline.map(m => { TL_ORDER.forEach(t => cum[t] += m[t]||0); return Object.assign({}, cum); });
+  const total = TL_ORDER.reduce((s,t) => s+cum[t], 0) || 1;
+  const X = i => PAD.l + (n>1 ? i/(n-1) : 0)*iw;
+  const Y = v => PAD.t + ih - v/total*ih;
   function areaPath(k){
-    const top=i=>{let s=0;for(let j=0;j<=k;j++)s+=pts[i][TL_ORDER[j]];return s;};
-    const bot=i=>{let s=0;for(let j=0;j<k;j++)s+=pts[i][TL_ORDER[j]];return s;};
-    let d='M'+X(0).toFixed(1)+','+Y(top(0)).toFixed(1);
-    for(let i=1;i<n;i++) d+=' L'+X(i).toFixed(1)+','+Y(top(i)).toFixed(1);
-    for(let i=n-1;i>=0;i--) d+=' L'+X(i).toFixed(1)+','+Y(bot(i)).toFixed(1);
+    const top = i => { let s=0; for(let j=0;j<=k;j++) s += pts[i][TL_ORDER[j]]; return s; };
+    const bot = i => { let s=0; for(let j=0;j<k;j++) s += pts[i][TL_ORDER[j]]; return s; };
+    let d = 'M'+X(0).toFixed(1)+','+Y(top(0)).toFixed(1);
+    for(let i=1;i<n;i++) d += ' L'+X(i).toFixed(1)+','+Y(top(i)).toFixed(1);
+    for(let i=n-1;i>=0;i--) d += ' L'+X(i).toFixed(1)+','+Y(bot(i)).toFixed(1);
     return d+'Z';
   }
-  let defs='<defs>';
-  TL_ORDER.forEach((t,k)=>{ const c=TC[t]||TC.Other;   // id by index — theme names may hold spaces/non-ASCII
-    defs+='<linearGradient id="g_'+k+'" x1="0" y1="0" x2="0" y2="1">'+
-      '<stop offset="0" stop-color="'+c+'" stop-opacity="0.95"/>'+
-      '<stop offset="1" stop-color="'+c+'" stop-opacity="0.30"/></linearGradient>';});
-  defs+='<clipPath id="past"><rect id="pastrect" x="'+PAD.l+'" y="0" width="0" height="'+h+'"/></clipPath></defs>';
-  let dim='', bright='';
-  TL_ORDER.forEach((t,k)=>{ if(!cum[t]) return; const p=areaPath(k);
-    dim+='<path d="'+p+'" fill="url(#g_'+k+')" opacity="0.15"/>';
-    bright+='<path d="'+p+'" fill="url(#g_'+k+')" opacity="0.92"/>';});
-  let axis='<line x1="'+PAD.l+'" y1="'+(PAD.t+ih)+'" x2="'+(w-PAD.r)+'" y2="'+(PAD.t+ih)+'" stroke="rgba(148,163,184,.22)"/>';
-  const step=Math.max(1,Math.ceil(n/Math.max(3,Math.floor(iw/66))));
-  for(let i=0;i<n;i+=step){ axis+='<text x="'+X(i).toFixed(1)+'" y="'+(h-5)+'" fill="#7f93b0" font-size="10" text-anchor="middle">'+shortMonth(months[i])+'</text>';
-    axis+='<line x1="'+X(i).toFixed(1)+'" y1="'+(PAD.t+ih)+'" x2="'+X(i).toFixed(1)+'" y2="'+(PAD.t+ih+3)+'" stroke="rgba(148,163,184,.3)"/>';}
-  const ph='<g id="phead"><line y1="'+(PAD.t-3)+'" y2="'+(PAD.t+ih+3)+'" stroke="#eef4fb" stroke-width="1.5" opacity="0.9"/>'+
-    '<circle cy="'+(PAD.t-3)+'" r="4" fill="#eef4fb"/></g>';
+  let defs = '<defs>';
+  TL_ORDER.forEach((t,k) => { const c = themeColor(t);   // id by index — theme names may hold spaces/non-ASCII
+    defs += '<linearGradient id="g_'+k+'" x1="0" y1="0" x2="0" y2="1">'+
+      '<stop offset="0" stop-color="'+c+'" stop-opacity="0.82"/>'+
+      '<stop offset="1" stop-color="'+c+'" stop-opacity="0.22"/></linearGradient>'; });
+  defs += '<clipPath id="past"><rect id="pastrect" x="'+PAD.l+'" y="0" width="0" height="'+h+'"/></clipPath></defs>';
+  let dim = '', bright = '';
+  TL_ORDER.forEach((t,k) => { if(!cum[t]) return; const p = areaPath(k);
+    dim += '<path d="'+p+'" fill="url(#g_'+k+')" opacity="0.12"/>';
+    bright += '<path d="'+p+'" fill="url(#g_'+k+')" opacity="0.9"/>'; });
+  let axis = '<line x1="'+PAD.l+'" y1="'+(PAD.t+ih)+'" x2="'+(w-PAD.r)+'" y2="'+(PAD.t+ih)+
+    '" stroke="rgba(198,212,230,.16)"/>';
+  const step = Math.max(1, Math.ceil(n/Math.max(3, Math.floor(iw/66))));
+  for(let i=0;i<n;i+=step){
+    axis += '<text x="'+X(i).toFixed(1)+'" y="'+(h-5)+'" fill="#6e7986" font-size="9.5" text-anchor="middle">'+shortMonth(months[i])+'</text>';
+    axis += '<line x1="'+X(i).toFixed(1)+'" y1="'+(PAD.t+ih)+'" x2="'+X(i).toFixed(1)+'" y2="'+(PAD.t+ih+3)+'" stroke="rgba(198,212,230,.2)"/>';
+  }
+  const ph = '<g id="phead"><line y1="'+(PAD.t-3)+'" y2="'+(PAD.t+ih+3)+'" stroke="#e7ecf3" stroke-width="1.4" opacity="0.85"/>'+
+    '<circle cy="'+(PAD.t-3)+'" r="3.4" fill="#e7ecf3"/></g>';
   svg.setAttribute('viewBox','0 0 '+w+' '+h);
-  svg.innerHTML=defs+'<g>'+dim+'</g><g clip-path="url(#past)">'+bright+'</g>'+axis+ph;
-  TLG={PAD,iw,n,pts};
+  svg.innerHTML = defs+'<g>'+dim+'</g><g clip-path="url(#past)">'+bright+'</g>'+axis+ph;
+  TLG = {PAD, iw, n, pts};
   renderPlayhead();
 }
 function renderPlayhead(){
-  if(!TLG) return; const {PAD,iw,n,pts}=TLG;
-  const x=PAD.l+cutoff*iw;
-  const rect=document.getElementById('pastrect'); if(rect) rect.setAttribute('width',Math.max(0,x-PAD.l).toFixed(1));
-  const g=document.getElementById('phead'); if(g) g.setAttribute('transform','translate('+x.toFixed(1)+',0)');
-  const i=Math.max(0,Math.ceil(cutoff*n)-1);
-  const upto=TL_ORDER.reduce((s,t)=>s+pts[i][t],0);
-  document.getElementById('now').textContent=cutoffMonth();
-  document.getElementById('tot').textContent=upto+' notes';
+  if(!TLG) return;
+  const x = TLG.PAD.l + cutoff*TLG.iw;
+  const rect = $('pastrect'); if(rect) rect.setAttribute('width', Math.max(0, x-TLG.PAD.l).toFixed(1));
+  const g = $('phead'); if(g) g.setAttribute('transform','translate('+x.toFixed(1)+',0)');
+  const i = Math.max(0, Math.ceil(cutoff*TLG.n) - 1);
+  const upto = TL_ORDER.reduce((s,t) => s + (TLG.pts[i][t]||0), 0);
+  $('now').textContent = cutoffMonth();
+  $('tot').textContent = upto + ' notes created';
 }
-function tlSet(ev){ if(!TLG) return; const r=svg.getBoundingClientRect(); const {PAD,iw}=TLG;
-  setCutoff(((ev.clientX-r.left)-PAD.l)/iw); }
-let tlDrag=false;
-svg.addEventListener('pointerdown',e=>{tlDrag=true; svg.setPointerCapture(e.pointerId); tlSet(e);});
-svg.addEventListener('pointermove',e=>{
-  if(tlDrag) tlSet(e);
-  if(!TLG) return; const r=svg.getBoundingClientRect(); const {PAD,iw,n}=TLG;
-  const i=Math.round(((e.clientX-r.left)-PAD.l)/iw*(n-1));
-  if(i>=0 && i<n){ const m=DATA.timeline[i];
-    tip.style.display='block'; tip.style.left=(e.clientX-r.left)+'px';
-    const tot=TL_ORDER.reduce((s,t)=>s+(m[t]||0),0);
-    tip.innerHTML='<b>'+shortMonth(months[i])+'</b> · +'+tot+' that month<br>'+
-      TL_ORDER.filter(t=>(m[t]||0)>0)
-              .map(t=>'<span style="color:'+(TC[t]||TC.Other)+'">'+t+' '+(m[t]||0)+'</span>')
-              .join(' · '); }
-});
-svg.addEventListener('pointerup',()=>{tlDrag=false;});
-svg.addEventListener('pointerleave',()=>{tip.style.display='none';});
-window.addEventListener('resize',buildTimeline);
+function tlSet(ev){ if(!TLG) return; const r = svg.getBoundingClientRect();
+  setCutoff(((ev.clientX-r.left) - TLG.PAD.l)/TLG.iw); }
+function showTip(ev){
+  if(!TLG) return;
+  const r = svg.getBoundingClientRect();
+  const i = Math.round(((ev.clientX-r.left) - TLG.PAD.l)/TLG.iw*(TLG.n-1));
+  if(i < 0 || i >= TLG.n){ tip.style.display = 'none'; return; }
+  const m = DATA.timeline[i];
+  const sum = TL_ORDER.reduce((s,t) => s + (m[t]||0), 0);
+  tip.textContent = '';
+  const head = document.createElement('div'); head.className = 'tt-h';
+  head.textContent = shortMonth(months[i]) + '  +' + sum;
+  tip.append(head);
+  TL_ORDER.filter(t => (m[t]||0) > 0).forEach(t => {
+    const row = document.createElement('div'); row.className = 'tt-r';
+    const dot = document.createElement('i'); dot.style.background = themeColor(t);
+    const nm = document.createElement('span'); nm.textContent = t;
+    const ct = document.createElement('b'); ct.textContent = m[t];
+    row.append(dot, nm, ct); tip.append(row);
+  });
+  tip.style.display = 'block';
+  tip.style.left = (ev.clientX - r.left) + 'px';
+}
+let tlDrag = false;
+svg.addEventListener('pointerdown', e => { tlDrag = true; svg.setPointerCapture(e.pointerId); tlSet(e); });
+svg.addEventListener('pointermove', e => { if(tlDrag) tlSet(e); showTip(e); });
+svg.addEventListener('pointerup', () => { tlDrag = false; });
+svg.addEventListener('pointerleave', () => { tip.style.display = 'none'; });
+window.addEventListener('resize', buildTimeline);
 
+// ---- filtering ----
 function withinTime(n){
-  const c=(n.data('created')||'').slice(0,7);
+  const c = (n.data('created')||'').slice(0,7);
   if(!c) return true;
   return c <= cutoffMonth();
 }
+function isFlagged(n){ return n.data('freshness') === 'oxidized' || n.data('orphan'); }
 function apply(){
-  const q=(document.getElementById('search').value||'').toLowerCase().trim();
-  cy.batch(()=>{
-    cy.nodes().forEach(n=>{
-      const ok = themeOn[n.data('theme')] && typeOn[n.data('type')] && withinTime(n);
+  const q = ($('search').value||'').toLowerCase().trim();
+  let hits = 0;
+  cy.batch(() => {
+    cy.nodes().forEach(n => {
+      const ok = themeOn[n.data('theme')] && typeOn[n.data('type')] &&
+                 freshOn[n.data('freshness')] && withinTime(n) &&
+                 (!auditOn || isFlagged(n));
       n.toggleClass('hidden', !ok);
+      n.toggleClass('flag', auditOn && ok && isFlagged(n));
+      n.toggleClass('oxid', n.data('freshness') === 'oxidized');
       if(q){
-        const hit = ok && (n.data('title').toLowerCase().includes(q) ||
+        const hit = ok && ((n.data('title')||'').toLowerCase().includes(q) ||
                            (n.data('tags')||[]).join(' ').toLowerCase().includes(q));
+        if(hit) hits++;
         n.toggleClass('search', hit);
       } else n.removeClass('search');
     });
-    cy.edges().forEach(e=>{
+    cy.edges().forEach(e => {
       const vis = edgesVisible && !e.source().hasClass('hidden') && !e.target().hasClass('hidden');
       e.toggleClass('hidden', !vis);
     });
   });
-  document.getElementById('now').textContent = cutoffMonth();
-  const shown = cy.nodes().filter(n=>!n.hasClass('hidden')).length;
-  document.getElementById('counts').innerHTML =
-    `<span class="sub">${shown} / ${DATA.stats.nodes} notes · ${DATA.stats.edges} links</span>`;
+  const shown = cy.nodes().filter(n => !n.hasClass('hidden')).length;
+  $('cShown').textContent = shown + ' / ' + DATA.stats.nodes;
+  $('cLinks').textContent = (edgesVisible ? cy.edges().filter(e => !e.hasClass('hidden')).length
+                                          : 0) + ' / ' + DATA.stats.edges;
+  $('search').setAttribute('aria-label', q ? hits + ' matches for "' + q + '"' : 'Search notes and tags');
+  groupCount('ctThemes', themeEntries, themeOn);
+  groupCount('ctTypes', typeEntries, typeOn);
+  groupCount('ctFresh', freshEntries, freshOn);
+  $('now').textContent = cutoffMonth();
 }
-function setCutoff(f){ cutoff=Math.min(1,Math.max(0,f)); renderPlayhead(); apply(); }
+function setCutoff(f){ cutoff = Math.min(1, Math.max(0, f)); renderPlayhead(); apply(); }
+$('search').oninput = apply;
 
-document.getElementById('search').oninput=apply;
+// ---- audit lens ----
+const AUDIT = DATA.stats.audit || {flagged:0, oxidized:0, orphans:0};
+$('auditCt').textContent = AUDIT.flagged;
+function setAudit(on){
+  auditOn = on;
+  const btn = $('audit');
+  btn.classList.toggle('on', on);
+  btn.setAttribute('aria-pressed', String(on));
+  const note = $('auditNote');
+  note.textContent = '';
+  if(on){
+    // the lens is useless with its own bands filtered out
+    if(!freshOn.oxidized){ freshOn.oxidized = true; syncers.forEach(s => s()); }
+    const strong = document.createElement('b');
+    strong.textContent = AUDIT.flagged + ' flagged';
+    note.append(strong, document.createTextNode(
+      ' — ' + AUDIT.oxidized + ' oxidized (over a year), ' + AUDIT.orphans + ' orphan (no links). ' +
+      'Theme, type and timeline filters still apply.'));
+    note.hidden = false;
+  } else note.hidden = true;
+  apply();
+}
+$('audit').onclick = () => setAudit(!auditOn);
 
-// play growth
-let playing=false, raf=null;
-document.getElementById('play').onclick=function(){
-  playing=!playing; this.textContent=playing?'❚❚ Pause':'▶ Play growth';
-  if(playing){ if(cutoff>=1) setCutoff(0.02);
-    const step=()=>{ if(!playing) return;
-      setCutoff(cutoff+0.010);
-      if(cutoff>=1){ playing=false; document.getElementById('play').textContent='▶ Play growth'; return;}
-      raf=requestAnimationFrame(step); };
+// ---- inspector ----
+function fmtStamp(iso){
+  if(!iso) return 'none';
+  const d = iso.slice(0,10), t = iso.slice(11,16);
+  return t === '00:00' ? d : d + ' ' + t + ' UTC';
+}
+function fmtAge(days){
+  if(days === null || days === undefined) return 'unknown';
+  if(days === 0) return '0 days (today)';
+  return days + (days === 1 ? ' day' : ' days');
+}
+function chip(box, text, color){
+  const c = document.createElement('span'); c.className = 'chip';
+  if(color){ const d = document.createElement('span'); d.className = 'dot'; d.style.background = color; c.append(d); }
+  const t = document.createElement('span'); t.textContent = text; c.append(t);
+  box.append(c); return c;
+}
+function fact(dl, label, value, tone, mono){
+  const dt = document.createElement('dt'); dt.textContent = label;
+  const dd = document.createElement('dd'); dd.textContent = value;
+  if(tone) dd.dataset.tone = tone;
+  if(mono) dd.className = 'mono';
+  dl.append(dt, dd);
+}
+function inspect(n){
+  const d = n.data();
+  const band = BANDS[d.freshness] || BANDS.unknown;
+  $('insp').hidden = false;
+  $('iTitle').textContent = d.title;
+
+  const chips = $('iChips'); chips.textContent = '';
+  chip(chips, d.theme, themeColor(d.theme));
+  chip(chips, d.type);
+  chip(chips, band.label, band.color);
+  if(d.orphan) chip(chips, 'orphan', '#d5a163');
+
+  const score = typeof d.freshnessScore === 'number' ? d.freshnessScore : 0;
+  const meter = $('iMeter');
+  meter.style.width = Math.round(score*100) + '%';
+  meter.style.background = band.color;
+  meter.parentNode.title = 'Freshness score ' + score.toFixed(2) + ' of 1.00 (' + band.hint + ')';
+
+  const dl = $('iFacts'); dl.textContent = '';
+  fact(dl, 'Freshness', band.label + ' — ' + band.hint, d.freshness);
+  fact(dl, 'Age', fmtAge(d.ageDays), d.freshness);
+  fact(dl, 'Updated', fmtStamp(d.updated));
+  fact(dl, 'Source', SOURCE_LABEL[d.freshnessSource] || 'none');
+  fact(dl, 'Created', fmtStamp(d.created));
+  fact(dl, 'Links', String(d.deg));
+  fact(dl, 'Status', d.orphan ? 'Orphan — no resolved links' : 'Connected',
+       d.orphan ? 'flag' : null);
+  fact(dl, 'File', d.path || '—', null, true);
+
+  $('iSummary').textContent = d.summary || 'No summary in this note.';
+  const tags = $('iTags'); tags.textContent = '';
+  const tagList = d.tags || [];
+  $('iTagsSec').hidden = tagList.length === 0;
+  tagList.forEach(t => { const s = document.createElement('span'); s.className = 'tag';
+    s.textContent = t; tags.append(s); });
+
+  const nb = n.closedNeighborhood();
+  const others = nb.nodes().filter(x => x.id() !== n.id());
+  const box = $('iLinks'); box.textContent = '';
+  $('iLinksSec').hidden = others.length === 0;
+  $('iLinksHead').textContent = 'Connected (' + others.length + ')';
+  others.slice(0, 20).forEach(x => {
+    const a = document.createElement('a'); a.tabIndex = 0; a.setAttribute('role','button');
+    const dot = document.createElement('span'); dot.className = 'dot';
+    dot.style.background = themeColor(x.data('theme'));
+    const label = document.createElement('span'); label.textContent = x.data('title');
+    a.append(dot, label);
+    const go = () => { cy.animate({center:{eles:x}, zoom:Math.max(cy.zoom(), 1.05)}, {duration:DUR}); focus(x); };
+    a.onclick = go;
+    a.onkeydown = e => { if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); go(); } };
+    box.append(a);
+  });
+  if(others.length > 20){
+    const more = document.createElement('div'); more.className = 'more';
+    more.textContent = '+' + (others.length - 20) + ' more';
+    box.append(more);
+  }
+  return nb;
+}
+function focus(n){
+  cy.batch(() => {
+    cy.elements().addClass('dim').removeClass('hl sel');
+    const nb = n.closedNeighborhood();
+    nb.removeClass('dim').addClass('hl');
+    n.removeClass('hl').addClass('sel');
+  });
+  inspect(n);
+  $('insp').scrollTop = 0;
+}
+function clearFocus(){
+  cy.batch(() => cy.elements().removeClass('dim hl sel'));
+  $('insp').hidden = true;
+}
+cy.on('tap', 'node', e => {
+  cy.animate({center:{eles:e.target}, zoom:Math.max(cy.zoom(), 0.9)}, {duration:DUR});
+  focus(e.target);
+});
+cy.on('tap', e => { if(e.target === cy) clearFocus(); });
+cy.on('mouseover', 'node', e => { if($('insp').hidden) e.target.addClass('hl'); });
+cy.on('mouseout', 'node', e => { if($('insp').hidden) e.target.removeClass('hl'); });
+
+// ---- chrome wiring ----
+$('inspClose').onclick = clearFocus;
+$('fit').onclick = () => cy.animate({fit:{padding:60}}, {duration:DUR ? 380 : 0});
+$('toggleEdges').onclick = function(){
+  edgesVisible = !edgesVisible;
+  this.classList.toggle('on', edgesVisible);
+  this.setAttribute('aria-pressed', String(edgesVisible));
+  apply();
+};
+$('panelMin').onclick = function(){
+  const min = $('panel').classList.toggle('min');
+  this.setAttribute('aria-expanded', String(!min));
+  this.title = min ? 'Expand controls' : 'Collapse controls';
+};
+document.addEventListener('keydown', e => {
+  if((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')){ e.preventDefault(); $('search').focus(); return; }
+  if(e.key === 'Escape'){
+    if(document.activeElement === $('search') && $('search').value){ $('search').value = ''; apply(); }
+    else clearFocus();
+  }
+});
+
+// play growth — one long sweep, or a few discrete steps when motion is reduced
+let playing = false, raf = null, timer = null;
+$('play').onclick = function(){
+  playing = !playing;
+  this.setAttribute('aria-pressed', String(playing));
+  $('playLab').textContent = playing ? 'Pause' : 'Play growth';
+  $('icPlay').classList.toggle('h', playing);
+  $('icPause').classList.toggle('h', !playing);
+  const stop = () => { playing = false; $('play').setAttribute('aria-pressed','false');
+    $('playLab').textContent = 'Play growth'; $('icPlay').classList.remove('h');
+    $('icPause').classList.add('h'); };
+  if(!playing){ cancelAnimationFrame(raf); clearTimeout(timer); return; }
+  if(cutoff >= 1) setCutoff(0.02);
+  if(REDUCED){
+    const hop = () => { if(!playing) return;
+      setCutoff(cutoff + 0.08);
+      if(cutoff >= 1){ stop(); return; }
+      timer = setTimeout(hop, 260); };
+    hop();
+  } else {
+    const step = () => { if(!playing) return;
+      setCutoff(cutoff + 0.010);
+      if(cutoff >= 1){ stop(); return; }
+      raf = requestAnimationFrame(step); };
     step();
-  } else cancelAnimationFrame(raf);
+  }
 };
 
-// ---- interaction ----
-function focus(n){
-  cy.elements().addClass('dim');
-  const nb=n.closedNeighborhood();
-  nb.removeClass('dim').addClass('hl');
-  document.getElementById('detail').style.display='block';
-  document.getElementById('dT').textContent=n.data('title');
-  const created=(n.data('created')||'').replace('T',' ').slice(0,16);
-  document.getElementById('dM').innerHTML=
-     `<span class="chip"><span class="dot" style="background:${TC[n.data('theme')]||TC.Other}"></span>${n.data('theme')}</span>
-      &nbsp;·&nbsp; ${n.data('type')} &nbsp;·&nbsp; ${created} &nbsp;·&nbsp; ${n.data('deg')} links`;
-  const tg=document.getElementById('dTags'); tg.innerHTML='';
-  (n.data('tags')||[]).forEach(t=>{const s=document.createElement('span');s.className='tag';s.textContent=t;tg.append(s);});
-  document.getElementById('dS').textContent=n.data('summary')||'—';
-  const nbBox=document.getElementById('dNb'); nbBox.innerHTML='';
-  const others=nb.nodes().filter(x=>x.id()!==n.id());
-  if(others.length){
-    const h=document.createElement('div'); h.style.cssText='color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px';
-    h.textContent='Connected ('+others.length+')'; nbBox.append(h);
-    others.slice(0,18).forEach(x=>{const a=document.createElement('a');a.textContent='› '+x.data('title');
-      a.onclick=()=>{cy.animate({center:{eles:x},zoom:1.1},{duration:300}); focus(x);}; nbBox.append(a);});
-  }
-}
-cy.on('tap','node',e=>{ cy.animate({center:{eles:e.target},zoom:Math.max(cy.zoom(),0.9)},{duration:300}); focus(e.target); });
-cy.on('tap',e=>{ if(e.target===cy){ cy.elements().removeClass('dim hl'); document.getElementById('detail').style.display='none'; }});
-cy.on('mouseover','node',e=>{ if(document.getElementById('detail').style.display!=='block'){ e.target.addClass('hl'); }});
-cy.on('mouseout','node',e=>{ if(document.getElementById('detail').style.display!=='block'){ e.target.removeClass('hl'); }});
-
-document.getElementById('dClose').onclick=()=>{cy.elements().removeClass('dim hl');document.getElementById('detail').style.display='none';};
-document.getElementById('fit').onclick=()=>cy.animate({fit:{padding:60}},{duration:400});
-document.getElementById('toggleEdges').onclick=function(){edgesVisible=!edgesVisible;this.classList.toggle('off',!edgesVisible);apply();};
-
-cy.ready(()=>{ cy.fit(undefined,70); buildTimeline(); apply();
-  const h=document.getElementById('hint'); h.style.opacity=1; setTimeout(()=>h.style.opacity=0,4200); });
+cy.ready(() => {
+  cy.fit(undefined, 70);
+  buildTimeline();
+  apply();
+  const h = $('hint');
+  h.classList.add('show');
+  setTimeout(() => h.classList.remove('show'), 4600);
+});
 </script>
 </body></html>
 """
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Build one self-contained interactive HTML knowledge map from Markdown notes.")
     ap.add_argument("vault")
     ap.add_argument("out")
     ap.add_argument("--title", default="Knowledge Map")
     ap.add_argument("--source-label", default=None,
                     help="storage label shown in the header (e.g. 'gbrain: demo'); defaults to the path")
+    ap.add_argument("--as-of", default=None,
+                    help="reference ISO date/timestamp for deterministic freshness bands")
+    ap.add_argument("--cytoscape-js", default=None, metavar="PATH",
+                    help="inline a local cytoscape.min.js so the map needs no network "
+                         "(nothing is ever downloaded for you)")
+    ap.add_argument("--strict-offline", action="store_true",
+                    help="refuse to write anything unless --cytoscape-js supplies a valid local runtime")
     a = ap.parse_args()
-    payload = build(a.vault, a.title, a.source_label)
-    open(a.out, "w", encoding="utf-8").write(render(payload))
+
+    # validate everything that can fail *before* touching the output path
+    if a.as_of:
+        try:
+            parse_as_of(a.as_of)
+        except ValueError as exc:
+            ap.error(f"--as-of: {exc}")
+    runtime = None
+    if a.cytoscape_js:
+        try:
+            runtime = read_local_runtime(a.cytoscape_js)
+        except RuntimeUnavailable as exc:
+            ap.error(f"--cytoscape-js: {exc}. Nothing was written.")
+    elif a.strict_offline:
+        ap.error("--strict-offline needs a local Cytoscape runtime: pass "
+                 "--cytoscape-js PATH (e.g. a cytoscape.min.js you already have). "
+                 "Nothing is downloaded automatically and nothing was written.")
+
+    payload = build(a.vault, a.title, a.source_label, a.as_of)
+    out_html = render(payload, runtime=runtime, runtime_path=a.cytoscape_js)
+    with open(a.out, "w", encoding="utf-8") as fh:
+        fh.write(out_html)
     s = payload["stats"]
     print(f"map: {s['nodes']} nodes, {s['edges']} edges -> {a.out}")
     print(f"themes: {s['themes']}")
     print(f"types : {s['types']}")
+    print(f"fresh : {s['freshness']} (as of {s['asOf'][:10]})")
+    print(f"audit : {s['audit']['flagged']} flagged "
+          f"({s['audit']['oxidized']} oxidized, {s['audit']['orphans']} orphans)")
+    print(f"runtime: {payload['runtime']['label']} — {payload['runtime']['source']}")
 
 if __name__ == "__main__":
     main()

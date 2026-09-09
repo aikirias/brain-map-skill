@@ -7,10 +7,11 @@ license: MIT
 # brain-map — interactive knowledge map from your notes
 
 One command turns a folder of Markdown into a single self-contained `.html`: a
-force-directed graph (themes as colour, note types as shape, hubs labelled), a
-timeline you can scrub to watch the base grow, search + theme/type filters, and
-a detail panel for any node. Reads plain Markdown — pairs with the `save-note`
-skill, but works on any Obsidian vault.
+dark graphite constellation (themes as colour, note types as shape, freshness as
+luminance, hubs labelled), a timeline you can scrub to watch the base grow,
+search plus theme/type/freshness filters, an Audit lens for stale and orphaned
+notes, and an inspector for any node. Reads plain Markdown — pairs with the
+`save-note` skill, but works on any Obsidian vault.
 
 ## Try the bundled demo first (no setup)
 
@@ -36,7 +37,19 @@ The builder reads a directory of Markdown with YAML frontmatter (`tags`,
 python3 scripts/build_map.py <notes_dir> out.html --title "My Second Brain"
 ```
 
-Open `out.html`. It's one file, Cytoscape loaded from CDN.
+Open `out.html`. It's one file.
+
+Useful flags:
+
+- `--as-of 2026-06-15` — band freshness against a fixed date, so reports are reproducible.
+- `--cytoscape-js ./cytoscape.min.js` — inline a Cytoscape bundle the user already has,
+  making the file work with no network at all.
+- `--strict-offline` — refuse to write anything unless a plausible official Cytoscape 3
+  browser bundle is given. Validation is non-executing and best-effort.
+
+By default the file loads Cytoscape from a pinned CDN URL and labels itself
+**Network runtime** in its header; with an inlined bundle it says **Local runtime**.
+The builder never downloads anything, and never writes to the vault.
 
 ### Dependencies are optional
 
@@ -61,6 +74,11 @@ Open `out.html`. It's one file, Cytoscape loaded from CDN.
 - **Timeline** = `created` timestamps bucketed by month, stacked by theme. When a
   note has no `created` in its frontmatter, the file's own birth/modified time is
   used instead, so vanilla Obsidian vaults still get a timeline.
+- **Freshness** = first of `last_updated`, `updated`, `modified`, then `created`, then
+  the file timestamp. Age in days lands each note in one of five bands — **fresh** ≤7d,
+  **recent** ≤30d, **settled** ≤90d, **dormant** ≤365d, **oxidized** >365d (`unknown`
+  only when no date exists at all). Bands drive filters and labels; a separate
+  continuous score in [0,1] drives node luminance, saturation and halo.
 
 Richer cross-linking (people cards, meeting attendees, index/MOC pages) ⇒ a more
 legible map. save-note's people-registry + `[[links]]` are what make it cluster.
@@ -69,10 +87,15 @@ legible map. save-note's people-registry + `[[links]]` are what make it cluster.
 
 - **Scrub / Play** the timeline → graph filters to notes up to that month; Play
   animates the base growing from empty to today.
-- **Filter** by theme and type (live counts); **search** highlights matches.
-- **Click** a node → dim the rest, light up its neighbourhood, open a panel with
-  summary, tags, date, and a clickable list of connected notes.
-- Responsive: collapses to a phone-friendly layout on narrow screens.
+- **Filter** by theme, type and freshness band in collapsible groups (live counts);
+  **search** rings matches (⌘/Ctrl K focuses, Esc clears).
+- **Audit** isolates oxidized and orphan (unlinked) notes and reports both counts.
+- **Click** a node → dim the rest, light up its neighbourhood, render the selection at
+  full strength, and open the inspector: freshness band, age in days, updated timestamp,
+  which field it came from, created date, link count, orphan status, path, summary, tags,
+  and a clickable list of connected notes.
+- Responsive: collapses to a phone-friendly layout on narrow screens; honours
+  `prefers-reduced-motion`.
 
 ## Regenerate the demo corpus (optional)
 
