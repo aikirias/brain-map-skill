@@ -324,6 +324,10 @@ def load(vault):
                 "tags": tags, "created": created, "updated": updated,
                 "freshnessSource": freshness_source, "summary": summarize(body),
                 "path": rel, "source": fm.get("source", ""),
+                # `gbrain export` stamps `slug:` only when the stored slug is not
+                # a fixed point of its path slugifier; the GBrain adapter prefers
+                # it over the path. Consumed in build(), never rendered.
+                "slugHint": fm.get("slug", "") if isinstance(fm.get("slug", ""), str) else "",
             }
             register(title, title)
             register(os.path.splitext(fn)[0], title)
@@ -342,6 +346,265 @@ def load(vault):
             seen.add(key)
             edges.append({"source": source_id, "target": target_id})
     return nodes, edges
+
+# ── optional read-only GBrain enrichment ─────────────────────────────────────
+# Markdown-only stays the default and the fallback: every function below is
+# reached only when --gbrain is passed, and every failure inside them degrades
+# to the frontmatter/filesystem timestamps load() already computed.
+DEFAULT_HISTORY_LIMIT = 500
+
+GBRAIN_OFF = {"enabled": False, "status": "off", "mode": "markdown", "gaps": [],
+              "detail": "Markdown only — timestamps come from frontmatter, "
+                        "falling back to the file's own timestamp."}
+
+
+def gbrain_adapter():
+    """Load the sibling read-only adapter by path, or None if it is missing.
+
+    Loaded lazily and by path so a Markdown-only build never imports it and a
+    copy of build_map.py without the adapter still runs.
+    """
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gbrain_history.py")
+    spec = importlib.util.spec_from_file_location("gbrain_history", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except (OSError, ImportError, SyntaxError):
+        return None
+    return module
+
+
+def match_slugs(nodes, index, adapter, slug_prefix=""):
+    """{note title: brain slug} for the notes that exist in the brain."""
+    matched = {}
+    for title in sorted(nodes):
+        node = nodes[title]
+        for candidate in adapter.slug_candidates(node["path"], node.get("slugHint", ""), slug_prefix):
+            if candidate in index:
+                matched[title] = candidate
+                break
+    return matched
+
+
+def apply_gbrain(nodes, reader, adapter, want_history=False,
+                 history_limit=DEFAULT_HISTORY_LIMIT, slug_prefix=""):
+    """Overwrite matched notes' freshness with the brain's own numbers.
+
+    Precedence, highest first: the semantic GBrain stamp (a verified
+    `updated_at`, or the last version snapshot when a non-semantic touch came
+    after it), then the frontmatter update fields, then `created`, then the
+    file timestamp. Unmatched notes are left exactly as Markdown-only built
+    them — enrichment is per note, never all-or-nothing.
+    """
+    index = reader.pages()
+    matched = match_slugs(nodes, index, adapter, slug_prefix)
+    history, coverage = {}, history_coverage(want_history, history_limit)
+    if want_history and matched:
+        # Freshest first, slug-ascending on ties: a budget-truncated run reads
+        # the same pages every time.
+        order = sorted(set(matched.values()))
+        order.sort(key=lambda slug: index[slug]["updated"], reverse=True)
+        history, coverage = read_history(reader, adapter, order, history_limit)
+    for title, slug in matched.items():
+        facts = index[slug]
+        summary = history.get(slug) if want_history else None
+        verdict = adapter.classify(facts["updated"], summary)
+        if not verdict["updated"]:
+            continue
+        # Timestamps, counts and a status the inspector renders — nothing
+        # else. The slug and the source id that produced this match stay in
+        # `matched`/`index`: they are brain-internal names, they are never
+        # displayed, and a generated map is a file people share.
+        nodes[title].update({
+            "updated": verdict["updated"],
+            "freshnessSource": verdict["source"],
+            "brainUpdated": facts["updated"],
+            "revisions": verdict["revisions"],
+            "lastRevision": verdict["lastRevision"],
+            "historyStatus": verdict["status"],
+        })
+    # Counted per brain page, not per note: two files can legitimately resolve
+    # to the same slug, and one page's revisions are one page's revisions.
+    revisions_by_month, revision_events, revised_pages = {}, 0, 0
+    for slug in sorted(set(matched.values())):
+        summary = history.get(slug)
+        if not summary or summary.get("error"):
+            continue
+        revision_events += summary["revisions"]
+        revised_pages += 1 if summary["revisions"] else 0
+        for month, count in summary["months"].items():
+            revisions_by_month[month] = revisions_by_month.get(month, 0) + count
+    coverage.update({"revised": revised_pages, "events": revision_events})
+    diagnostics = dict(reader.diagnostics)
+    gaps = gbrain_gaps(diagnostics, coverage)
+    detail = ("Freshness comes from GBrain's own updated_at" +
+              (", cross-checked against page version history." if want_history
+               else " (version history not read)."))
+    if gaps:
+        # Per note, not all-or-nothing: the notes that matched a page keep the
+        # brain's numbers and say where they came from, and every other note
+        # keeps the Markdown ones. What the read missed is named here instead
+        # of being smoothed over.
+        detail += (" Partial read — %s. Matched notes keep the brain's timestamps; "
+                   "everything else keeps the Markdown ones." % "; ".join(gaps))
+    report = {
+        "enabled": True, "status": "partial" if gaps else "ok", "mode": "gbrain",
+        "detail": detail, "gaps": gaps,
+        "matched": len(matched), "indexed": len(index), "notes": len(nodes),
+        "history": coverage,
+        "diagnostics": diagnostics,
+    }
+    return report, revisions_by_month
+
+
+def history_coverage(requested, limit):
+    """The empty history ledger: what was asked for, read, refused and skipped."""
+    return {"requested": bool(requested), "matched": 0, "eligible": 0, "asked": 0,
+            "read": 0, "failed": 0, "incomplete": 0, "collisions": 0, "skipped": 0,
+            "limit": limit if requested else 0, "error": "", "unproven": "",
+            "revised": 0, "events": 0}
+
+
+def read_history(reader, adapter, order, limit):
+    """Version history for the slugs it is *safe* to ask about, and the ledger.
+
+    `get_versions` takes a bare slug and answers with the union of every source
+    that holds it, so only slugs the reader can prove are unique brain-wide are
+    ever asked for (see GBrainReader.history_scope). Everything it refuses —
+    a slug another source also holds, every slug when the collision check could
+    not cover the brain, and whatever a budget left over — keeps the backend
+    `updated_at` it already has and stays labelled `unverified`. None of that
+    is a clean read, so all of it is counted here and named in the gaps.
+    """
+    coverage = history_coverage(True, limit)
+    coverage["matched"] = len(order)
+    try:
+        scope = reader.history_scope()
+        safe = [slug for slug in order if slug in scope["unique"]]
+        coverage["eligible"] = len(safe)
+        # Refused *because they collide* only when the check actually proved
+        # something; an audit that fell short refused everything for one
+        # reason, and that reason is reported once instead of as N collisions.
+        coverage["collisions"] = len(order) - len(safe) if scope["proven"] else 0
+        coverage["unproven"] = scope["reason"]
+        if limit and limit > 0:
+            coverage["skipped"] = max(0, len(safe) - limit)
+        history = reader.history(safe, limit=limit, order=order) if safe else {}
+    except (adapter.GBrainUnavailable, adapter.GBrainToolError) as exc:
+        # The page index already came back clean. Losing the session half-way
+        # through history downgrades those notes to "history not read" — it
+        # does not throw away the updated_at we did get. Whatever a budget
+        # would have skipped is moot once the walk died: one gap, one reason.
+        # Backend-controlled exception text can contain private slugs or
+        # content. Keep the shareable payload categorical and non-sensitive.
+        coverage["error"], coverage["skipped"] = "the history transport failed", 0
+        return {}, coverage
+    coverage["asked"] = len(history)
+    coverage["failed"] = sum(1 for summary in history.values()
+                             if summary.get("error") and not summary.get("malformed"))
+    coverage["incomplete"] = sum(1 for summary in history.values()
+                                 if summary.get("malformed"))
+    coverage["read"] = coverage["asked"] - coverage["failed"] - coverage["incomplete"]
+    return history, coverage
+
+
+def gbrain_gaps(diagnostics, history):
+    """Everything the read did not cover, phrased for a human. [] when clean.
+
+    A page index that stopped early, a row that could not be read, a slug the
+    adapter refused to guess at, a history read that failed for one page and a
+    budget that stopped short of the rest all leave the same hole: notes that
+    exist in the brain but were not enriched from it, or were enriched without
+    the history that would confirm the number. They are reported as `partial`
+    rather than as a clean `ok`, so a build never claims coverage it does not
+    have — and `--gbrain-required` refuses such a build outright.
+    """
+    gaps = []
+    if diagnostics.get("truncated"):
+        gaps.append("the page index stopped early, so some pages were never seen")
+    for key, phrase in (("ambiguous", "%d slug(s) exist in more than one source and "
+                                      "cannot be resolved (use --gbrain-source)"),
+                        ("foreign", "%d row(s) came back from a source other than the "
+                                    "one requested and were dropped"),
+                        ("malformed", "%d row(s) were unreadable")):
+        count = diagnostics.get(key) or 0
+        if count:
+            gaps.append(phrase % count)
+    return gaps + history_gaps(history or {})
+
+
+def history_gaps(history):
+    """What a version-history read left unproven. [] when it covered everything."""
+    if not history.get("requested"):
+        return []
+    gaps = []
+    if history.get("error"):
+        gaps.append("version history stopped early (%s)" % history["error"])
+    if history.get("unproven"):
+        gaps.append("no page history was read: %s, so no slug could be shown to "
+                    "belong to exactly one page" % history["unproven"])
+    if history.get("collisions"):
+        gaps.append("%d matched page(s) share a slug with another source, so their "
+                    "history would be a union of both and was not read"
+                    % history["collisions"])
+    if history.get("skipped"):
+        gaps.append("--gbrain-history-limit %d read the %d freshest of %d eligible "
+                    "page(s); the other %d kept an unverified backend timestamp "
+                    "(use --gbrain-history-limit 0 for all of them)"
+                    % (history["limit"], history["asked"], history["eligible"],
+                       history["skipped"]))
+    if history.get("failed"):
+        gaps.append("version history could not be read for %d page(s)" % history["failed"])
+    if history.get("incomplete"):
+        gaps.append("%d page(s) came back with unreadable version rows, so their "
+                    "revision counts are unknown" % history["incomplete"])
+    return gaps
+
+
+def enrich_from_gbrain(nodes, options):
+    """Run the adapter, or explain in the payload why it did not run.
+
+    Fail-open is the contract: an absent binary, a brain that will not start,
+    a protocol change or a malformed answer all leave the Markdown-derived map
+    intact and record the reason. A read that only half worked is reported as
+    `partial` — the notes that did match keep the brain's timestamps, every
+    other note keeps the Markdown ones, and the gaps are named. Both cases
+    become hard errors under --gbrain-required, before anything is written.
+    """
+    adapter = gbrain_adapter()
+    empty = {}
+    if adapter is None:
+        detail = "scripts/gbrain_history.py is missing — cannot read the brain."
+        if options.get("required"):
+            raise RuntimeError(detail)
+        return dict(GBRAIN_OFF, status="unavailable", detail=detail), empty
+    reader = None
+    try:
+        reader = adapter.open_reader(
+            command=options.get("command") or adapter.DEFAULT_COMMAND,
+            source_id=options.get("source"),
+            want_history=bool(options.get("history")),
+            timeout=options.get("timeout") or adapter.DEFAULT_TIMEOUT)
+        report, revisions_by_month = apply_gbrain(
+            nodes, reader, adapter,
+            want_history=bool(options.get("history")),
+            history_limit=options.get("historyLimit", DEFAULT_HISTORY_LIMIT),
+            slug_prefix=options.get("slugPrefix", ""))
+        if options.get("required") and report["status"] != "ok":
+            raise RuntimeError("GBrain read was incomplete: %s" % "; ".join(report["gaps"]))
+        return report, revisions_by_month
+    except (adapter.GBrainUnavailable, adapter.GBrainToolError) as exc:
+        if options.get("required"):
+            raise RuntimeError("GBrain adapter failed: %s" % exc)
+        return dict(GBRAIN_OFF, status="unavailable",
+                    detail="GBrain unavailable — kept the Markdown timestamps."), empty
+    finally:
+        if reader is not None:
+            reader.close()
+
 
 # ── layout ───────────────────────────────────────────────────────────────────
 def layout(nodes, edges):
@@ -376,8 +639,14 @@ def layout(nodes, edges):
     return out
 
 # ── build payload ────────────────────────────────────────────────────────────
-def build(vault, title, source_label=None, as_of=None):
+def build(vault, title, source_label=None, as_of=None, gbrain=None):
     nodes, edges = load(vault)
+    # Markdown first, brain second: enrichment overwrites the freshness of the
+    # notes it can match and leaves every other note untouched.
+    gbrain_report, revisions_by_month = (enrich_from_gbrain(nodes, gbrain) if gbrain
+                                         else (dict(GBRAIN_OFF), {}))
+    for node in nodes.values():
+        node.pop("slugHint", None)      # matching input, not map data
     reference = parse_as_of(as_of) if as_of else datetime.datetime.now(datetime.timezone.utc)
     pos = layout(nodes, edges)
     use_preset = pos is not None
@@ -406,7 +675,21 @@ def build(vault, title, source_label=None, as_of=None):
         if re.match(r"\d{4}-\d{2}", c):
             months.setdefault(c, {t: 0 for t in all_themes})
             months[c][n["theme"]] += 1
+    # Creation growth (the stacked areas) and true revisions (the overlay) are
+    # different events, so the axis is the union of the months either of them
+    # happened in: a month that added no notes but rewrote a dozen is a real
+    # month on this chart, with zero creations and a revision count, not a gap
+    # in the axis and a number dropped off the edge.
+    for month in revisions_by_month:
+        months.setdefault(month, {t: 0 for t in all_themes})
     timeline = [{"month": m, **months[m]} for m in sorted(months)]
+    axis = [row["month"] for row in timeline]
+    revisions = {
+        "available": bool(gbrain_report.get("history", {}).get("requested")) and bool(revisions_by_month),
+        "series": [revisions_by_month.get(m, 0) for m in axis],
+        "events": sum(revisions_by_month.values()),
+        "pages": gbrain_report.get("history", {}).get("revised", 0),
+    }
     themes = {}
     types = {}
     for n in nodes.values():
@@ -429,7 +712,8 @@ def build(vault, title, source_label=None, as_of=None):
         "source": source_label or safe_source,
         # Deliberately omit the absolute vault path: generated maps are often shared.
         "layout": "preset" if use_preset else "cose",
-        "timeline": timeline, "themeColors": theme_colors, "themeOrder": theme_order,
+        "timeline": timeline, "revisions": revisions, "gbrain": gbrain_report,
+        "themeColors": theme_colors, "themeOrder": theme_order,
         "typeShapes": TYPE_SHAPES, "freshnessOrder": list(FRESHNESS_ORDER),
         "runtime": {"mode": "network", "label": "Network runtime", "source": CYTOSCAPE_CDN,
                     "detail": "Cytoscape loads from a pinned CDN URL; your notes stay in this file."},
@@ -438,7 +722,10 @@ def build(vault, title, source_label=None, as_of=None):
                   "span": [min((n["created"][:10] for n in nodes.values() if n["created"]), default=""),
                            max((n["created"][:10] for n in nodes.values() if n["created"]), default="")],
                   "asOf": reference.isoformat(timespec="seconds"),
-                  "freshness": freshness_counts, "audit": audit},
+                  "freshness": freshness_counts, "audit": audit,
+                  "gbrain": {"status": gbrain_report["status"],
+                             "matched": gbrain_report.get("matched", 0),
+                             "revisions": revisions["events"]}},
     }
 
 # ── HTML ─────────────────────────────────────────────────────────────────────
@@ -512,6 +799,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   #dock .src{display:flex;align-items:center;gap:5px;color:var(--muted);font-size:11px;
      font-family:ui-monospace,SFMono-Regular,Menlo,monospace;max-width:38vw;overflow:hidden}
   #dock .src span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #dock .src span[data-tone="flag"]{color:var(--warn)}
   #dock .src svg{width:11px;height:11px;flex:0 0 auto;opacity:.65}
   .stat{display:flex;flex-direction:column;gap:1px;white-space:nowrap}
   .stat b{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--ink)}
@@ -754,7 +1042,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 
 <footer id="tl" class="panel">
   <div class="head">
-    <span class="eyebrow">Timeline &middot; cumulative</span>
+    <span class="eyebrow" id="tlEyebrow">Timeline &middot; cumulative</span>
     <button class="play" id="play" aria-pressed="false">
       <svg viewBox="0 0 24 24" fill="currentColor" id="icPlay"><path d="M8 5l12 7-12 7z"/></svg>
       <svg viewBox="0 0 24 24" fill="currentColor" id="icPause" class="h"><path d="M7 5h4v14H7zm6 0h4v14h-4z"/></svg>
@@ -784,15 +1072,33 @@ const BANDS = {
 };
 const BAND_ORDER = DATA.freshnessOrder || Object.keys(BANDS);
 const SOURCE_LABEL = {
+  gbrain_history:'GBrain updated_at (verified by page history)',
+  gbrain_revision:'GBrain page history (last content revision)',
+  gbrain_updated:'GBrain updated_at (history not read)',
   last_updated:'frontmatter last_updated', updated:'frontmatter updated',
   modified:'frontmatter modified', created:'frontmatter created (no update field)',
   filesystem:'file timestamp (no date in frontmatter)'
 };
+const HISTORY_NOTE = {
+  verified:'confirmed by GBrain page history',
+  superseded:'last backend touch was not a content write',
+  'single-write':'written once, never revised',
+  inconsistent:'page history disagrees with the backend timestamp — neither is confirmed',
+  unverified:'page history was not read',
+  error:'page history unavailable for this note'
+};
+// GBrain enrichment is optional; DATA.gbrain always says which mode produced
+// the timestamps, so the map never implies a freshness it did not measure.
+const GB = DATA.gbrain || {status:'off', detail:''};
 
 // ---- header ----
 $('ttl').textContent = DATA.title;
-$('srcTxt').textContent = DATA.source;
-$('srcTxt').title = DATA.source;
+// A partial read says so in the header rather than passing for a clean one;
+// the reason is in `detail`, which is the tooltip.
+const GB_TAG = {ok:' \u00b7 gbrain', partial:' \u00b7 gbrain (partial)'};
+$('srcTxt').textContent = DATA.source + (GB_TAG[GB.status] || '');
+$('srcTxt').title = DATA.source + (GB.detail ? ' \u2014 ' + GB.detail : '');
+if(GB.status === 'partial') $('srcTxt').dataset.tone = 'flag';
 $('cLinks').textContent = DATA.stats.edges;
 const SPAN = DATA.stats.span;
 $('cSpan').textContent = (SPAN[0] && SPAN[1]) ? SPAN[0] + ' to ' + SPAN[1] : 'undated';
@@ -965,6 +1271,12 @@ function cutoffMonth(){
   return months[idx] || months[months.length-1] || '';
 }
 const TL_ORDER = DATA.themeOrder || Object.keys(DATA.themeColors);
+// Creation growth is the stacked area; revisions are a separate line, because a
+// quiet month for new notes can still be a busy month for rewrites.
+const REVS = DATA.revisions || {};
+const REV = (REVS.available && Array.isArray(REVS.series) &&
+             REVS.series.length === DATA.timeline.length) ? REVS.series : null;
+if(REV) $('tlEyebrow').textContent = 'Timeline \u00b7 cumulative + revisions';
 const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const chart = $('tlchart'), svg = $('tlsvg'), tip = $('tltip');
 let TLG = null;
@@ -998,6 +1310,17 @@ function buildTimeline(){
   TL_ORDER.forEach((t,k) => { if(!cum[t]) return; const p = areaPath(k);
     dim += '<path d="'+p+'" fill="url(#g_'+k+')" opacity="0.12"/>';
     bright += '<path d="'+p+'" fill="url(#g_'+k+')" opacity="0.9"/>'; });
+  let revline = '';
+  if(REV){
+    const peak = Math.max.apply(null, REV) || 1;
+    const RY = v => PAD.t + ih - (v/peak)*ih*0.62;
+    let d = '';
+    for(let i=0;i<n;i++) d += (i ? ' L' : 'M') + X(i).toFixed(1) + ',' + RY(REV[i]||0).toFixed(1);
+    revline = '<path d="'+d+'" fill="none" stroke="#d5a163" stroke-width="1.3" ' +
+              'stroke-opacity="0.85" stroke-linejoin="round" stroke-linecap="round"/>' +
+              (n === 1 ? '<circle cx="'+X(0).toFixed(1)+'" cy="'+RY(REV[0]||0).toFixed(1)+
+                         '" r="2" fill="#d5a163"/>' : '');
+  }
   let axis = '<line x1="'+PAD.l+'" y1="'+(PAD.t+ih)+'" x2="'+(w-PAD.r)+'" y2="'+(PAD.t+ih)+
     '" stroke="rgba(198,212,230,.16)"/>';
   const step = Math.max(1, Math.ceil(n/Math.max(3, Math.floor(iw/66))));
@@ -1008,7 +1331,7 @@ function buildTimeline(){
   const ph = '<g id="phead"><line y1="'+(PAD.t-3)+'" y2="'+(PAD.t+ih+3)+'" stroke="#e7ecf3" stroke-width="1.4" opacity="0.85"/>'+
     '<circle cy="'+(PAD.t-3)+'" r="3.4" fill="#e7ecf3"/></g>';
   svg.setAttribute('viewBox','0 0 '+w+' '+h);
-  svg.innerHTML = defs+'<g>'+dim+'</g><g clip-path="url(#past)">'+bright+'</g>'+axis+ph;
+  svg.innerHTML = defs+'<g>'+dim+'</g><g clip-path="url(#past)">'+bright+'</g>'+revline+axis+ph;
   TLG = {PAD, iw, n, pts};
   renderPlayhead();
 }
@@ -1020,7 +1343,13 @@ function renderPlayhead(){
   const i = Math.max(0, Math.ceil(cutoff*TLG.n) - 1);
   const upto = TL_ORDER.reduce((s,t) => s + (TLG.pts[i][t]||0), 0);
   $('now').textContent = cutoffMonth();
-  $('tot').textContent = upto + ' notes created';
+  let read = upto + ' notes created';
+  if(REV){
+    let revised = 0;
+    for(let j=0;j<=i;j++) revised += REV[j]||0;
+    read += ' \u00b7 ' + revised + ' revisions';
+  }
+  $('tot').textContent = read;
 }
 function tlSet(ev){ if(!TLG) return; const r = svg.getBoundingClientRect();
   setCutoff(((ev.clientX-r.left) - TLG.PAD.l)/TLG.iw); }
@@ -1042,6 +1371,13 @@ function showTip(ev){
     const ct = document.createElement('b'); ct.textContent = m[t];
     row.append(dot, nm, ct); tip.append(row);
   });
+  if(REV && REV[i]){
+    const row = document.createElement('div'); row.className = 'tt-r';
+    const dot = document.createElement('i'); dot.style.background = '#d5a163';
+    const nm = document.createElement('span'); nm.textContent = 'revisions';
+    const ct = document.createElement('b'); ct.textContent = REV[i];
+    row.append(dot, nm, ct); tip.append(row);
+  }
   tip.style.display = 'block';
   tip.style.left = (ev.clientX - r.left) + 'px';
 }
@@ -1166,6 +1502,22 @@ function inspect(n){
   fact(dl, 'Age', fmtAge(d.ageDays), d.freshness);
   fact(dl, 'Updated', fmtStamp(d.updated));
   fact(dl, 'Source', SOURCE_LABEL[d.freshnessSource] || 'none');
+  // `revisions` is null whenever the count is unknown — including when the
+  // history read for this page failed — so the count cannot be the condition
+  // for showing what happened. The status is.
+  const HS = d.historyStatus || '';
+  if(typeof d.revisions === 'number' || HS === 'error'){
+    const note = HISTORY_NOTE[HS] || '';
+    const count = typeof d.revisions === 'number'
+      ? (d.revisions === 1 ? '1 revision' : d.revisions + ' revisions') : '';
+    const text = count ? (note ? count + ' \u2014 ' + note : count) : (note || HS);
+    fact(dl, 'Revisions', text, HS === 'error' || HS === 'inconsistent' ? 'flag' : null);
+  }
+  if(d.brainUpdated && d.brainUpdated !== d.updated)
+    fact(dl, 'Backend touch', fmtStamp(d.brainUpdated) + ' \u2014 not a content write');
+  if(HS === 'inconsistent' && d.lastRevision)
+    fact(dl, 'Last revision', fmtStamp(d.lastRevision) +
+         ' \u2014 newer than the backend timestamp', 'flag');
   fact(dl, 'Created', fmtStamp(d.created));
   fact(dl, 'Links', String(d.deg));
   fact(dl, 'Status', d.orphan ? 'Orphan — no resolved links' : 'Connected',
@@ -1301,7 +1653,55 @@ def main():
                          "(nothing is ever downloaded for you)")
     ap.add_argument("--strict-offline", action="store_true",
                     help="refuse to write anything unless --cytoscape-js supplies a valid local runtime")
+    grp = ap.add_argument_group(
+        "GBrain (optional, read-only)",
+        "Off by default. When on, freshness comes from the brain's own updated_at "
+        "instead of the export's frontmatter. Nothing is ever written to GBrain.")
+    grp.add_argument("--gbrain", action="store_true",
+                     help="read semantic updated_at from GBrain (one `gbrain serve` "
+                          "MCP session, batched list_pages)")
+    grp.add_argument("--gbrain-history", action="store_true",
+                     help="also read per-page version history (get_versions) to tell real "
+                          "revisions from re-embeds and renames; implies --gbrain")
+    grp.add_argument("--gbrain-history-limit", type=int, default=DEFAULT_HISTORY_LIMIT,
+                     metavar="N",
+                     help="cap history reads at the N most recently updated matched pages "
+                          f"(default {DEFAULT_HISTORY_LIMIT}; 0 = every matched page)")
+    grp.add_argument("--gbrain-cmd", default=None, metavar="BIN",
+                     help="gbrain executable to run (default: gbrain on PATH)")
+    grp.add_argument("--gbrain-source", default=None, metavar="ID",
+                     help="scope reads to one GBrain source id ('__all__' spans every source)")
+    grp.add_argument("--gbrain-slug-prefix", default="", metavar="P",
+                     help="slug prefix to prepend to path-derived slugs when the vault is a "
+                          "subdirectory of a `gbrain export` tree")
+    grp.add_argument("--gbrain-timeout", type=float, default=None, metavar="S",
+                     help="seconds to wait for any single GBrain read (default 20)")
+    grp.add_argument("--gbrain-required", action="store_true",
+                     help="fail the build instead of falling back to Markdown when GBrain "
+                          "cannot be read, or could only be read in part (a truncated page "
+                          "index, dropped rows, ambiguous slugs, history that stopped early)")
     a = ap.parse_args()
+
+    use_gbrain = a.gbrain or a.gbrain_history
+    if not use_gbrain:
+        tuning = [name for name, given in (
+            ("--gbrain-cmd", a.gbrain_cmd is not None),
+            ("--gbrain-source", a.gbrain_source is not None),
+            ("--gbrain-slug-prefix", bool(a.gbrain_slug_prefix)),
+            ("--gbrain-timeout", a.gbrain_timeout is not None),
+            ("--gbrain-history-limit", a.gbrain_history_limit != DEFAULT_HISTORY_LIMIT),
+            ("--gbrain-required", a.gbrain_required)) if given]
+        if tuning:
+            ap.error(f"{', '.join(tuning)} needs --gbrain (or --gbrain-history); "
+                     "without it the build is Markdown-only and the option would do nothing.")
+    if a.gbrain_history_limit < 0:
+        ap.error("--gbrain-history-limit: must be 0 (no cap) or a positive count")
+    if a.gbrain_timeout is not None and a.gbrain_timeout <= 0:
+        ap.error("--gbrain-timeout: must be greater than 0 seconds")
+    gbrain = {"command": a.gbrain_cmd, "source": a.gbrain_source,
+              "history": a.gbrain_history, "historyLimit": a.gbrain_history_limit,
+              "slugPrefix": a.gbrain_slug_prefix, "timeout": a.gbrain_timeout,
+              "required": a.gbrain_required} if use_gbrain else None
 
     # validate everything that can fail *before* touching the output path
     if a.as_of:
@@ -1320,7 +1720,13 @@ def main():
                  "--cytoscape-js PATH (e.g. a cytoscape.min.js you already have). "
                  "Nothing is downloaded automatically and nothing was written.")
 
-    payload = build(a.vault, a.title, a.source_label, a.as_of)
+    try:
+        payload = build(a.vault, a.title, a.source_label, a.as_of, gbrain=gbrain)
+    except RuntimeError as exc:      # --gbrain-required and the read was not clean
+        ap.error(f"{exc}. Nothing was written.")
+    report = payload["gbrain"]
+    if report["status"] not in ("ok", "off"):
+        print(f"warning: {report['detail']}", file=sys.stderr)
     out_html = render(payload, runtime=runtime, runtime_path=a.cytoscape_js)
     with open(a.out, "w", encoding="utf-8") as fh:
         fh.write(out_html)
@@ -1332,6 +1738,18 @@ def main():
     print(f"audit : {s['audit']['flagged']} flagged "
           f"({s['audit']['oxidized']} oxidized, {s['audit']['orphans']} orphans)")
     print(f"runtime: {payload['runtime']['label']} — {payload['runtime']['source']}")
+    if report["status"] in ("ok", "partial"):
+        history = report["history"]
+        line = (f"gbrain : {report['matched']}/{s['nodes']} notes matched "
+                f"({report['indexed']} pages indexed)")
+        if history["requested"]:
+            line += (f", {history['events']} revisions across {history['revised']} pages"
+                     f" (history read for {history['read']}/{history['matched']})")
+        if report["status"] == "partial":
+            line += " — PARTIAL: " + "; ".join(report["gaps"])
+        print(line)
+    elif report["status"] != "off":
+        print(f"gbrain : {report['status']} — Markdown timestamps kept")
 
 if __name__ == "__main__":
     main()
