@@ -24,7 +24,7 @@ build time. Pass --cytoscape-js PATH to inline a Cytoscape bundle you already
 have, which makes the file work with no network at all ("Local runtime").
 --strict-offline refuses to write anything unless such a local bundle is given.
 """
-import os, re, sys, json, html, datetime, argparse, hashlib
+import os, re, sys, json, html, math, datetime, argparse, hashlib
 
 try:
     import networkx as nx
@@ -277,8 +277,9 @@ def load(vault):
         else:
             aliases[key] = None
 
-    for root, _, files in os.walk(vault):
-        for fn in files:
+    for root, dirs, files in os.walk(vault):
+        dirs.sort()          # deterministic on every filesystem, so collision
+        for fn in sorted(files):  # suffixes and alias winners never depend on walk order
             if not fn.endswith(".md"): continue
             path = os.path.join(root, fn)
             rel = os.path.relpath(path, vault)
@@ -344,15 +345,13 @@ def load(vault):
     return nodes, edges
 
 # ── layout ───────────────────────────────────────────────────────────────────
-def layout(nodes, edges):
-    if nx is None:
-        return None  # signal: let the browser compute a force layout (cose)
-    G = nx.Graph()
-    G.add_nodes_from(nodes.keys())
-    for e in edges: G.add_edge(e["source"], e["target"])
-    # seed by theme so clusters separate cleanly — anchors generated on a ring
-    # for whatever themes exist, with "Other" parked in the middle.
-    import math
+CANVAS_W, CANVAS_H = 4200, 3000
+
+def seed_positions(nodes):
+    """Deterministic starting positions in unit space: themes on a ring (Other
+    in the middle), each node hash-jittered around its theme anchor. Used to
+    seed the spring layout, and — scaled — as the starting state of the
+    in-browser cose fallback, so stdlib-only builds are deterministic too."""
     ring = sorted({n["theme"] for n in nodes.values()} - {"Other"})
     theme_anchor = {t: (math.cos(2 * math.pi * i / max(1, len(ring))),
                         math.sin(2 * math.pi * i / max(1, len(ring))))
@@ -364,36 +363,140 @@ def layout(nodes, edges):
         h = int(hashlib.md5(nid.encode()).hexdigest(), 16)
         init[nid] = (ax + ((h % 1000) / 1000 - 0.5) * 0.6,
                      ay + (((h // 1000) % 1000) / 1000 - 0.5) * 0.6)
-    pos = nx.spring_layout(G, pos=init, k=0.45, iterations=240, seed=7)
-    # scale to pixels
+    return init
+
+def scale_positions(pos):
+    """Map unit-space positions onto the fixed pixel canvas, centred on 0,0."""
     xs = [p[0] for p in pos.values()]; ys = [p[1] for p in pos.values()]
     minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
-    W, H = 4200, 3000
+    return {nid: ((x - minx) / (maxx - minx + 1e-9) * CANVAS_W - CANVAS_W / 2,
+                  (y - miny) / (maxy - miny + 1e-9) * CANVAS_H - CANVAS_H / 2)
+            for nid, (x, y) in pos.items()}
+
+def layout(nodes, edges):
+    if nx is None:
+        return None  # signal: let the browser compute a force layout (cose)
+    G = nx.Graph()
+    G.add_nodes_from(nodes.keys())
+    # intra-theme links pull twice as hard, so communities separate cleanly
+    # without moving colour out of its data role
+    for e in edges:
+        same = nodes[e["source"]]["theme"] == nodes[e["target"]]["theme"]
+        G.add_edge(e["source"], e["target"], weight=2.0 if same else 1.0)
+    pos = nx.spring_layout(G, pos=seed_positions(nodes), k=0.45, iterations=240, seed=7)
+    return scale_positions(pos)
+
+
+def node_size(deg):
+    """Node diameter grows with the square root of degree, so node *area* tracks
+    link count roughly linearly — hubs read as landmarks instead of drowning the
+    field the way linear diameter growth did."""
+    return round(12 + 5.0 * math.sqrt(min(max(deg, 0), 49)), 1)
+
+
+def _coordinate(value):
+    """A finite float, or None when the payload holds something unusable.
+
+    JSON permits `NaN`/`Infinity` literals and hand-edited maps hold anything at
+    all; a non-finite coordinate would silently poison the layout (Cytoscape
+    drops the node, and any new note placed at the centroid of its neighbours
+    inherits the NaN). Rejecting it here keeps the bad value out of the map."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def read_positions(path):
+    """{node id: (x, y)} recovered from a previously generated brain-map HTML.
+
+    Powers --keep-positions: rebuilding after edits keeps every surviving note
+    where the reader already knows it, instead of reshuffling the whole sky.
+    Nodes whose coordinates are missing, non-numeric or non-finite are skipped
+    rather than trusted — a partly readable map still keeps what it can."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    m = re.search(r"const DATA = (\{.*?\});\n", text, re.S)
+    if not m:
+        raise ValueError(f"{path} does not look like a generated brain-map HTML file")
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path}: embedded payload is not valid JSON: {exc}") from exc
     out = {}
-    for nid, (x, y) in pos.items():
-        out[nid] = ((x - minx) / (maxx - minx + 1e-9) * W - W / 2,
-                    (y - miny) / (maxy - miny + 1e-9) * H - H / 2)
+    raw_nodes = data.get("nodes")
+    for node in raw_nodes if isinstance(raw_nodes, list) else []:
+        if not isinstance(node, dict):
+            continue
+        meta = node.get("data")
+        nid = meta.get("id") if isinstance(meta, dict) else None
+        p = node.get("position")
+        if not isinstance(nid, str) or not isinstance(p, dict):
+            continue
+        x, y = _coordinate(p.get("x")), _coordinate(p.get("y"))
+        if x is None or y is None:
+            continue
+        out[nid] = (x, y)
+    if not out:
+        raise ValueError(f"{path} holds no node positions (was it built with a preset layout?)")
     return out
 
+
+def merge_kept_positions(nodes, edges, pos, kept):
+    """Overlay positions from a previous map. New notes land at the centroid of
+    their already-placed neighbours (hash-jittered), or keep their computed/seed
+    position when nothing links them to the old sky. Deterministic throughout."""
+    neighbours = {}
+    for e in edges:
+        neighbours.setdefault(e["source"], []).append(e["target"])
+        neighbours.setdefault(e["target"], []).append(e["source"])
+    merged = {}
+    for nid in nodes:
+        if nid in kept:
+            merged[nid] = kept[nid]
+            continue
+        placed = [kept[o] for o in neighbours.get(nid, []) if o in kept]
+        if placed:
+            h = int(hashlib.md5(nid.encode()).hexdigest(), 16)
+            merged[nid] = (sum(p[0] for p in placed) / len(placed) + ((h % 200) - 100) * 0.6,
+                           sum(p[1] for p in placed) / len(placed) + (((h // 200) % 200) - 100) * 0.6)
+        else:
+            merged[nid] = pos[nid]
+    return merged
+
 # ── build payload ────────────────────────────────────────────────────────────
-def build(vault, title, source_label=None, as_of=None):
+def build(vault, title, source_label=None, as_of=None, keep_positions=None):
     nodes, edges = load(vault)
     reference = parse_as_of(as_of) if as_of else datetime.datetime.now(datetime.timezone.utc)
     pos = layout(nodes, edges)
     use_preset = pos is not None
+    if pos is None:
+        # no networkx: ship deterministic theme-seeded positions as the starting
+        # state for the in-browser force layout (cose, randomize off)
+        pos = scale_positions(seed_positions(nodes))
+    if keep_positions:
+        kept = {nid: keep_positions[nid] for nid in nodes if nid in keep_positions}
+        if kept:
+            pos = merge_kept_positions(nodes, edges, pos, kept)
+            use_preset = True
     deg = {nid: 0 for nid in nodes}
     for e in edges:
         deg[e["source"]] += 1; deg[e["target"]] += 1
     cy_nodes = []
     for nid, n in nodes.items():
         band, age_days, score = freshness_for(n["updated"], reference)
+        x, y = pos[nid]
         node = {"data": {**n, "deg": deg[nid], "orphan": deg[nid] == 0,
                          "freshness": band, "ageDays": age_days,
                          "freshnessScore": score,
-                         "size": 14 + min(deg[nid], 40) * 2.4}}
-        if use_preset:
-            x, y = pos[nid]
-            node["position"] = {"x": round(x, 1), "y": round(y, 1)}
+                         "size": node_size(deg[nid])},
+                "position": {"x": round(x, 1), "y": round(y, 1)}}
         cy_nodes.append(node)
     cy_edges = [{"data": {"id": f"e{i}", "source": e["source"], "target": e["target"],
                           "theme": nodes[e["source"]]["theme"]}}
@@ -533,7 +636,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   .minbtn:hover{color:var(--ink);border-color:var(--line)}
   .minbtn svg{width:13px;height:13px;transition:transform .18s ease}
   #panel.min .minbtn svg{transform:rotate(-90deg)}
-  #panel.min .p-body,#panel.min .tools,#panel.min .note{display:none}
+  #panel.min .p-body,#panel.min .tools,#panel.min .note,#panel.min .s-info{display:none}
   .searchwrap{position:relative;display:flex;align-items:center}
   .searchwrap .s-ico{position:absolute;left:10px;width:13px;height:13px;color:var(--muted-2);
      pointer-events:none}
@@ -545,6 +648,9 @@ TEMPLATE = r"""<!DOCTYPE html>
   .kbd{position:absolute;right:8px;padding:2px 5px;border:1px solid var(--line);border-radius:5px;
      background:var(--surface-2);color:var(--muted);font:10.5px ui-monospace,monospace;
      pointer-events:none}
+  .s-info{margin:7px 2px 0;font-size:11.5px;color:var(--muted);
+     font-variant-numeric:tabular-nums}
+  .s-info[hidden]{display:none}
   .tools{display:flex;gap:6px;margin-top:9px}
   .tool{flex:1;padding:7px 6px;border-radius:var(--r-sm);border:1px solid var(--line);
      background:var(--surface-2);color:var(--ink-2);cursor:pointer;font-size:12px;font-weight:550;
@@ -583,13 +689,21 @@ TEMPLATE = r"""<!DOCTYPE html>
   .filter.off .box svg{display:none}
   .filter.off{opacity:.45}
   .filter .sw{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+  .filter .glyph{width:12px;height:12px;flex:0 0 auto;color:#8fa0b3}
   .filter .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px}
-  .filter .ct{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;font-size:11.5px}
+  .filter .only{margin-left:auto;flex:0 0 auto;padding:1px 6px;border:1px solid var(--line);
+     border-radius:5px;background:var(--surface-2);color:var(--muted);font-size:10px;
+     cursor:pointer;opacity:0;transition:opacity .15s ease}
+  .filter:hover .only,.filter:focus-within .only,.filter .only:focus-visible{opacity:1}
+  .filter .only:hover{color:var(--ink);border-color:#33404e}
+  .filter .ct{color:var(--muted);font-variant-numeric:tabular-nums;font-size:11.5px}
 
   /* ── inspector ────────────────────────────────────────────────────────── */
   #insp{position:fixed;right:16px;top:78px;width:326px;z-index:6;padding:15px;
-     max-height:calc(100vh - 250px);overflow-y:auto;overscroll-behavior:contain}
+     max-height:calc(100vh - 250px);overflow-y:auto;overscroll-behavior:contain;
+     animation:insp-in .18s ease}
   #insp[hidden]{display:none}
+  @keyframes insp-in{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
   .p-body::-webkit-scrollbar,#insp::-webkit-scrollbar{width:8px}
   .p-body::-webkit-scrollbar-thumb,#insp::-webkit-scrollbar-thumb{background:#2b333d;border-radius:8px}
   .p-body::-webkit-scrollbar-track,#insp::-webkit-scrollbar-track{background:transparent}
@@ -636,6 +750,7 @@ TEMPLATE = r"""<!DOCTYPE html>
      background:var(--surface-2);color:var(--ink-2);border-radius:var(--r-sm);padding:5px 11px;
      font-size:12px;font-weight:550}
   #tl .play:hover{border-color:#33404e;color:var(--ink)}
+  #tl .play[aria-pressed="true"]{border-color:var(--accent);color:var(--ink)}
   #tl .play svg{width:11px;height:11px}
   #tl .read{margin-left:auto;display:flex;gap:12px;align-items:baseline}
   #tl .read .now{font-size:12.5px;font-variant-numeric:tabular-nums;color:var(--ink)}
@@ -706,6 +821,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       <input id="search" type="search" placeholder="Search notes and tags" aria-label="Search notes and tags" autocomplete="off" spellcheck="false">
       <kbd class="kbd" id="kbd">Ctrl K</kbd>
     </div>
+    <p class="s-info" id="searchInfo" role="status" hidden></p>
     <div class="tools">
       <button class="tool" id="fit" title="Fit the whole constellation">Reset</button>
       <button class="tool on" id="toggleEdges" aria-pressed="true" title="Show or hide links">Links</button>
@@ -828,7 +944,10 @@ function nodeColor(n){
 
 function layoutOpts(){
   if(DATA.layout === 'cose'){
-    return { name:'cose', animate:false, randomize:true, fit:true, padding:70,
+    // the builder ships deterministic theme-seeded positions; starting cose from
+    // them (randomize off) keeps stdlib-only builds deterministic too
+    const seeded = !!(DATA.nodes[0] && DATA.nodes[0].position);
+    return { name:'cose', animate:false, randomize:!seeded, fit:true, padding:70,
              nodeRepulsion:9000, idealEdgeLength:62, edgeElasticity:0.4,
              gravity:0.35, numIter:1200, coolingFactor:0.95, nodeDimensionsIncludeLabels:false };
   }
@@ -839,14 +958,15 @@ const cy = cytoscape({
   elements: { nodes: DATA.nodes, edges: DATA.edges },
   layout: layoutOpts(),
   wheelSensitivity: 0.22,
+  hideEdgesOnViewport: DATA.edges.length > 1500,   // keep pan/zoom fluid on big graphs
   pixelRatio: Math.min(window.devicePixelRatio||1, 2),
   style: [
     { selector:'node', style:{
         'width':'data(size)','height':'data(size)',
         'shape': n => DATA.typeShapes[n.data('type')] || 'ellipse',
         'background-color': nodeColor,                                  // saturation falls with age
-        'background-opacity': n => 0.40 + 0.58*FS(n),                   // luminance falls with age
-        'background-blacken': n => 0.34*(1 - FS(n)),
+        'background-opacity': n => 0.48 + 0.50*FS(n),                   // luminance falls with age
+        'background-blacken': n => 0.30*(1 - FS(n)),
         'underlay-color': n => themeColor(n.data('theme')),             // halo only for fresh notes
         'underlay-shape':'ellipse',
         'underlay-padding': n => 1 + 9*Math.pow(FS(n), 1.6),
@@ -855,15 +975,24 @@ const cy = cytoscape({
         'border-color':'#3c4653','border-style':'dashed','border-opacity':0.9,
         'label':'','transition-property':'opacity','transition-duration':'120ms'
     }},
-    // semantic hierarchy: hubs always named, mid-degree names appear when you zoom in
+    // semantic hierarchy: landmark hubs named even at overview zoom, ordinary
+    // hubs named once you approach, mid-degree names appear zoomed right in
     { selector:'node.hub', style:{ 'label':'data(title)','color':'#cdd8e6','font-size':11,
         'font-weight':600,'text-outline-width':2.4,'text-outline-color':'#0a0c10',
-        'text-max-width':126,'text-wrap':'ellipsis','min-zoomed-font-size':7 }},
+        'text-max-width':126,'text-wrap':'ellipsis','min-zoomed-font-size':7,
+        'border-width':1.2,'border-style':'solid','border-opacity':0.5,
+        'border-color': n => themeColor(n.data('theme')) }},
+    { selector:'node.landmark', style:{ 'font-size':26,'color':'#dfe7f1',
+        'text-outline-width':3.5,'text-max-width':300,'min-zoomed-font-size':6 }},
     { selector:'node.lab', style:{ 'label':'data(title)','color':'#9fabba','font-size':9.5,
         'text-outline-width':2,'text-outline-color':'#0a0c10','text-max-width':104,
         'text-wrap':'ellipsis','min-zoomed-font-size':8 }},
     { selector:'edge', style:{                                          // quiet by default
-        'width':0.8,'curve-style':'straight','opacity':0.12,'line-color':'#63707e' }},
+        'width':0.8,'curve-style':'haystack','haystack-radius':0,
+        'opacity':0.12,'line-color':'#63707e' }},
+    { selector:'edge.hov', style:{ 'opacity':0.4,'width':1.3,
+        'line-color': e => themeColor(e.data('theme')) }},
+    { selector:'node.sdim', style:{ 'opacity':0.15 }},                  // search: non-matches recede
     { selector:'.dim', style:{ 'opacity':0.05 }},
     { selector:'node.hl', style:{ 'opacity':1,'label':'data(title)','color':'#e7ecf3','font-size':11.5,
         'text-outline-width':0,'text-background-color':'#0a0c10','text-background-opacity':0.82,
@@ -894,6 +1023,11 @@ cy.nodes().forEach(n => {
   const d = n.data('deg');
   if(d >= 7) n.addClass('hub'); else if(d >= 3) n.addClass('mid');
 });
+// the strongest hubs stay named even at overview zoom — deterministic pick:
+// degree desc, then id, so the same map always names the same landmarks
+cy.nodes('.hub').sort((a,b) => b.data('deg') - a.data('deg') ||
+                               (a.id() < b.id() ? -1 : 1))
+  .slice(0, 12).filter(n => n.data('deg') >= 10).addClass('landmark');
 let wideLabels = false;
 cy.on('zoom', () => {
   const on = cy.zoom() > 1.2;
@@ -919,6 +1053,26 @@ function checkMark(){
   p.setAttribute('d','M5 13l4.5 4.5L19 7'); s.append(p);
   return s;
 }
+// static outline glyphs mirroring the node shapes, so the Types list doubles
+// as the legend for what each shape means in the graph
+const SHAPE_GLYPHS = {
+  'ellipse':'<circle cx="6" cy="6" r="4.6"/>',
+  'round-rectangle':'<rect x="1.8" y="1.8" width="8.4" height="8.4" rx="2"/>',
+  'hexagon':'<polygon points="6.0,1.4 10.0,3.7 10.0,8.3 6.0,10.6 2.0,8.3 2.0,3.7"/>',
+  'round-pentagon':'<polygon points="6.0,1.4 10.4,4.6 8.7,9.7 3.3,9.7 1.6,4.6"/>',
+  'diamond':'<polygon points="6.0,1.2 10.8,6.0 6.0,10.8 1.2,6.0"/>',
+  'round-diamond':'<polygon points="6.0,1.2 10.8,6.0 6.0,10.8 1.2,6.0"/>',
+  'star':'<polygon points="6.0,1.1 7.2,4.3 10.7,4.5 8.0,6.6 8.9,10.0 6.0,8.1 3.1,10.0 4.0,6.6 1.3,4.5 4.8,4.3"/>',
+  'round-tag':'<path d="M1.8 3h5.4L10.6 6 7.2 9H1.8z"/>'
+};
+function shapeGlyph(shape){
+  const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('viewBox','0 0 12 12'); svg.setAttribute('class','glyph');
+  svg.setAttribute('fill','none'); svg.setAttribute('stroke','currentColor');
+  svg.setAttribute('stroke-width','1.3'); svg.setAttribute('stroke-linejoin','round');
+  svg.innerHTML = SHAPE_GLYPHS[shape] || SHAPE_GLYPHS.ellipse;   // static chrome, never note data
+  return svg;
+}
 function buildFilters(elId, entries, state){
   const box = $(elId);
   entries.forEach(item => {
@@ -926,15 +1080,27 @@ function buildFilters(elId, entries, state){
     row.className = 'filter'; row.tabIndex = 0; row.setAttribute('role','checkbox');
     if(item.hint) row.title = item.label + ' — ' + item.hint;
     const bx = document.createElement('span'); bx.className = 'box'; bx.append(checkMark());
-    const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = item.color;
+    const mark = item.shape ? shapeGlyph(item.shape)
+      : (() => { const sw = document.createElement('span'); sw.className = 'sw';
+                 sw.style.background = item.color; return sw; })();
     const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = item.label;
+    const only = document.createElement('button'); only.type = 'button'; only.className = 'only';
+    only.textContent = 'only'; only.setAttribute('aria-label', 'Show only ' + item.label);
+    only.onclick = ev => {
+      ev.stopPropagation();
+      // second press on an already-solo entry restores the whole group
+      const solo = entries.every(e2 => !!state[e2.key] === (e2.key === item.key));
+      entries.forEach(e2 => state[e2.key] = solo ? true : e2.key === item.key);
+      syncers.forEach(s => s()); apply();
+    };
     const ct = document.createElement('span'); ct.className = 'ct'; ct.textContent = item.count;
-    row.append(bx, sw, nm, ct); box.append(row);
+    row.append(bx, mark, nm, only, ct); box.append(row);
     const sync = () => { const on = !!state[item.key];
       row.classList.toggle('off', !on); row.setAttribute('aria-checked', String(on)); };
     const toggle = () => { state[item.key] = !state[item.key]; sync(); apply(); };
     row.onclick = toggle;
-    row.onkeydown = e => { if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); toggle(); } };
+    row.onkeydown = e => { if(e.target !== row) return;
+      if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); toggle(); } };
     syncers.push(sync);
     sync();
   });
@@ -944,7 +1110,8 @@ const themeEntries = (DATA.themeOrder || Object.keys(DATA.stats.themes))
   .map(t => ({key:t, label:t, count:DATA.stats.themes[t], color:themeColor(t)}));
 const typeEntries = Object.keys(DATA.stats.types)
   .sort((a,b) => DATA.stats.types[b] - DATA.stats.types[a] || a.localeCompare(b))
-  .map(t => ({key:t, label:t, count:DATA.stats.types[t], color:'#4d5865'}));
+  .map(t => ({key:t, label:t, count:DATA.stats.types[t],
+              shape:DATA.typeShapes[t] || 'ellipse'}));
 const freshEntries = BAND_ORDER
   .filter(b => (DATA.stats.freshness || {})[b])
   .map(b => ({key:b, label:BANDS[b].label, hint:BANDS[b].hint,
@@ -1075,7 +1242,8 @@ function apply(){
                            (n.data('tags')||[]).join(' ').toLowerCase().includes(q));
         if(hit) hits++;
         n.toggleClass('search', hit);
-      } else n.removeClass('search');
+        n.toggleClass('sdim', ok && !hit);   // non-matches recede so hits ring out
+      } else n.removeClass('search sdim');
     });
     cy.edges().forEach(e => {
       const vis = edgesVisible && !e.source().hasClass('hidden') && !e.target().hasClass('hidden');
@@ -1087,6 +1255,10 @@ function apply(){
   $('cLinks').textContent = (edgesVisible ? cy.edges().filter(e => !e.hasClass('hidden')).length
                                           : 0) + ' / ' + DATA.stats.edges;
   $('search').setAttribute('aria-label', q ? hits + ' matches for "' + q + '"' : 'Search notes and tags');
+  const si = $('searchInfo');
+  si.hidden = !q;
+  if(q) si.textContent = hits ? hits + (hits === 1 ? ' match' : ' matches') + ' — Esc clears'
+                              : 'No matches in the current view';
   groupCount('ctThemes', themeEntries, themeOn);
   groupCount('ctTypes', typeEntries, typeOn);
   groupCount('ctFresh', freshEntries, freshOn);
@@ -1221,8 +1393,15 @@ cy.on('tap', 'node', e => {
   focus(e.target);
 });
 cy.on('tap', e => { if(e.target === cy) clearFocus(); });
-cy.on('mouseover', 'node', e => { if($('insp').hidden) e.target.addClass('hl'); });
-cy.on('mouseout', 'node', e => { if($('insp').hidden) e.target.removeClass('hl'); });
+cy.on('mouseover', 'node', e => {
+  $('cy').style.cursor = 'pointer';
+  if($('insp').hidden){ e.target.addClass('hl'); e.target.connectedEdges().addClass('hov'); }
+});
+cy.on('mouseout', 'node', e => {
+  $('cy').style.cursor = '';
+  if($('insp').hidden) e.target.removeClass('hl');
+  e.target.connectedEdges().removeClass('hov');
+});
 
 // ---- chrome wiring ----
 $('inspClose').onclick = clearFocus;
@@ -1296,6 +1475,10 @@ def main():
                     help="storage label shown in the header (e.g. 'gbrain: demo'); defaults to the path")
     ap.add_argument("--as-of", default=None,
                     help="reference ISO date/timestamp for deterministic freshness bands")
+    ap.add_argument("--keep-positions", default=None, metavar="MAP_HTML",
+                    help="reuse node positions from a previously generated map, so a rebuild "
+                         "keeps every surviving note where you already know it; new notes "
+                         "land beside their neighbours")
     ap.add_argument("--cytoscape-js", default=None, metavar="PATH",
                     help="inline a local cytoscape.min.js so the map needs no network "
                          "(nothing is ever downloaded for you)")
@@ -1309,6 +1492,12 @@ def main():
             parse_as_of(a.as_of)
         except ValueError as exc:
             ap.error(f"--as-of: {exc}")
+    kept_positions = None
+    if a.keep_positions:
+        try:
+            kept_positions = read_positions(a.keep_positions)
+        except ValueError as exc:
+            ap.error(f"--keep-positions: {exc}. Nothing was written.")
     runtime = None
     if a.cytoscape_js:
         try:
@@ -1320,7 +1509,7 @@ def main():
                  "--cytoscape-js PATH (e.g. a cytoscape.min.js you already have). "
                  "Nothing is downloaded automatically and nothing was written.")
 
-    payload = build(a.vault, a.title, a.source_label, a.as_of)
+    payload = build(a.vault, a.title, a.source_label, a.as_of, keep_positions=kept_positions)
     out_html = render(payload, runtime=runtime, runtime_path=a.cytoscape_js)
     with open(a.out, "w", encoding="utf-8") as fh:
         fh.write(out_html)
