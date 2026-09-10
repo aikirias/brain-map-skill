@@ -41,6 +41,9 @@ python3 scripts/build_map.py <notes_dir> out.html --as-of 2026-06-15
 # Fully offline file: inline a Cytoscape bundle you already have on disk
 python3 scripts/build_map.py <notes_dir> out.html --cytoscape-js ./cytoscape.min.js
 
+# GBrain export? Read the brain's real updated_at and revision history (read-only)
+python3 scripts/build_map.py <export_dir> out.html --gbrain-history
+
 open out.html
 ```
 
@@ -73,7 +76,8 @@ no server required either way.
 - **Freshness** = the first of `last_updated`, `updated`, `modified` present, then `created`,
   then the file's own timestamp. The inspector always names which one it used. Filesystem
   time is an approximate transport signal and may be reset by a copy, checkout, export or
-  sync; it must not be interpreted as semantic GBrain history.
+  sync; it must not be interpreted as semantic GBrain history. With `--gbrain` the brain's
+  own `updated_at` outranks all of them — see below.
 
 ### Freshness: five bands and a continuous score
 
@@ -97,6 +101,64 @@ gradient rather than five flat buckets. The inspector shows the exact score.
 
 **Audit** is a lens, not a band: it isolates oxidized **and** orphan (unlinked) notes, and
 states the counts for each while it's active. Theme, type and timeline filters keep applying.
+
+## Real GBrain timestamps and history (optional)
+
+A Markdown export carries `created` and whatever update field the page happened to have.
+It does **not** carry GBrain's own `updated_at`, and no revision history at all — so a
+vault you exported or re-cloned this morning reads as uniformly fresh by mtime, or
+uniformly ancient by `created`. `--gbrain` goes and asks the brain instead.
+
+```bash
+python3 scripts/build_map.py <export_dir> out.html --gbrain            # backend updated_at
+python3 scripts/build_map.py <export_dir> out.html --gbrain-history    # + version history
+```
+
+| Flag | What it does |
+|------|--------------|
+| `--gbrain` | freshness comes from the brain's `updated_at`, read in batches through one `gbrain serve` MCP session |
+| `--gbrain-history` | also reads `get_versions` per matched page, so a re-embed or a rename is not mistaken for a content update; implies `--gbrain` |
+| `--gbrain-history-limit N` | cap history at the N most recently updated eligible pages (default 500, `0` = all — see below) |
+| `--gbrain-source ID` | scope reads to one source (`__all__` spans every source) |
+| `--gbrain-slug-prefix P` | match when the vault is a subdirectory of an export tree |
+| `--gbrain-cmd BIN` | use a specific `gbrain` executable |
+| `--gbrain-timeout S` | per-read timeout (default 20s) |
+| `--gbrain-required` | fail the build — writing nothing — if the brain cannot be read, or could only be read in part |
+
+- **Read-only, always.** Only `list_pages` and `get_versions` are ever called — both
+  `scope: 'read'`. Nothing is written to the brain or the vault. MCP cannot stream a reply,
+  so a page's history does arrive as one decoded message — it is projected to timestamps
+  immediately after decoding, capped at 16 MiB per reply, and nothing but counts and dates
+  survives the call, so no private prose from any old version reaches the HTML. Brain slugs
+  and source ids are matching inputs and are not written into the file either.
+- **Fail-open by default.** No `gbrain` on PATH, no brain, a refused handshake, a garbled
+  answer or a hung server all leave a normal Markdown-built map plus a `warning:` line.
+  Markdown-only remains the default mode and the fallback.
+- **Partial is said out loud.** If the page index stopped early, a slug turned out to live
+  in two sources, a page's history failed or came back partly unreadable, or the history
+  budget stopped short, the build is labelled `partial` in the CLI and in the map's header,
+  with the reasons and counts listed. The notes that did match still keep the brain's
+  timestamps — enrichment is per note, never all-or-nothing — and everything else keeps its
+  Markdown ones. `--gbrain-required` refuses such a build outright and writes nothing.
+- **History is only read for slugs that provably belong to one page.** `get_versions` takes
+  a bare slug and answers with the union of every source that holds it, so a slug two
+  sources share is never asked about — including under a concrete `--gbrain-source`, which
+  is checked against one extra read-only `list_pages source_id='__all__'` collision audit
+  before any history is read. Such a page keeps the backend `updated_at` and is labelled
+  unverified, never given a revision count.
+- **`--gbrain-history-limit` is a real limit.** The default reads the 500 most recently
+  updated eligible pages; a brain with more than that comes back `partial` with the
+  requested / read / skipped counts, the unread pages keep an unverified backend timestamp,
+  and `--gbrain-required` fails. Pass `--gbrain-history-limit 0` for full coverage, at one
+  round-trip per page.
+- **Honest labels.** The inspector says which of `gbrain_history` (confirmed by a version
+  snapshot), `gbrain_revision` (the last backend touch was *not* a content write) or
+  `gbrain_updated` (unconfirmed — a single write, history not read, history unreadable, or
+  history that contradicts `updated_at`) produced the date, and the timeline grows a second
+  series for true revisions on top of creation growth.
+
+The exact `updated_at` / `page_versions` semantics, the replay and diff rules, and the
+backend limitations are written up in [docs/gbrain-history.md](docs/gbrain-history.md).
 
 ### Privacy and offline behavior
 
@@ -174,7 +236,11 @@ python3 -m unittest discover -s tests
 Stdlib `unittest`, no dependencies — covers the freshness bands and score, GBrain slug
 resolution, payload shape, `--keep-positions` (parsing, surviving notes, placement of new
 notes, malformed and non-finite payloads), runtime inlining and refusal, template safety
-contracts, and CLI error handling. Browser tests skip here with an install hint.
+contracts, and CLI error handling. `tests/test_gbrain_history.py` adds the adapter: timestamp
+precedence, missing and malformed history, backend failure and fail-open, deterministic budgets,
+and the read-only guarantee — all against `tests/fixtures/fake_gbrain.py`, a scripted MCP server
+over invented pages, so the suite never needs a real brain. Browser tests skip here with an
+install hint.
 
 **Browser tests** drive a generated map with real Cytoscape — search, filtering, the
 inspector, the timeline and Audit mode, through actual clicks, drags and key presses:
@@ -199,35 +265,52 @@ skip and say how to install them; the command above runs them.
 
 ## GBrain coverage and roadmap
 
-This release is a **read-only page-topology review**, not a second memory system. It reads
-Markdown pages, frontmatter and resolved wikilinks—including GBrain relative slugs—and never
-writes back to GBrain.
+A **read-only review of the brain**, not a second memory system. Markdown pages,
+frontmatter and resolved wikilinks (including GBrain relative slugs) are always read from
+disk; with `--gbrain` the builder additionally reads `list_pages` and `get_versions` through
+one `gbrain serve` MCP session. It never writes to GBrain, and it keeps no database of its
+own.
 
-What v1 does not yet represent:
+Covered now:
+
+- backend `updated_at` as the freshness signal, batched and paged, with the provenance
+  named in the inspector;
+- page version history: revision counts and dates per page, used to tell a real content
+  write apart from a re-embed, a rename or a revert;
+- a timeline that separates creation growth from true revisions.
+
+Still not represented:
 
 - hot facts, supersessions, expirations or fact provenance;
 - typed backend edges that are not rendered as Markdown wikilinks;
 - embedding coverage or retrieval health;
-- true page-version/edge history. The timeline is a creation-date growth view, not replay.
+- **side-by-side version diffs.** The semantics are documented and the data is one
+  `get_versions` call away, but rendering old bodies would put private prose from every
+  past revision into a shareable HTML file, so the adapter deliberately keeps only
+  timestamps. See [docs/gbrain-history.md](docs/gbrain-history.md) §5 for the exact diff
+  and replay rules if you want to build that on top.
 
-Freshness uses the best signal present in each file (`last_updated`, `updated`, `modified`,
-then `created`). Filesystem `mtime` is only an explicitly labelled approximation and may be
-reset by copying or syncing a vault. A future deterministic GBrain adapter should consume
-backend `updated_at`/history and add version-diff review without requiring an LLM or creating
-a duplicate graph database. Deeper structural analysis can be exported to Gephi rather than
-turning this static viewer into another operational service.
+Without `--gbrain`, freshness uses the best signal present in each file (`last_updated`,
+`updated`, `modified`, then `created`). Filesystem `mtime` is only an explicitly labelled
+approximation and may be reset by copying or syncing a vault. Deeper structural analysis can
+be exported to Gephi rather than turning this static viewer into another operational service.
 
 ## Layout
 
 ```
 brain-map-skill/
 ├── SKILL.md                      # agent skill spec
+├── docs/
+│   └── gbrain-history.md         # updated_at / version semantics, replay, limits
 ├── scripts/
 │   ├── build_map.py              # the builder (Markdown dir → interactive HTML)
+│   ├── gbrain_history.py         # optional read-only GBrain adapter (MCP stdio)
 │   └── generate_demo_notes.py    # writes the fictional demo vault
 ├── tests/
 │   ├── test_build_map.py         # stdlib unittest suite
-│   └── test_browser_ui.py        # Playwright UI tests (optional dependency)
+│   ├── test_browser_ui.py        # Playwright UI tests (optional dependency)
+│   ├── test_gbrain_history.py    # adapter: precedence, failure, determinism
+│   └── fixtures/fake_gbrain.py   # scripted MCP server over invented pages
 ├── demo/
 │   ├── brain-map.html            # PREBUILT — open it, zero setup
 │   ├── vault/                    # 992 source Markdown notes

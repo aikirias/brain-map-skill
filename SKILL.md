@@ -32,6 +32,8 @@ The builder reads a directory of Markdown with YAML frontmatter (`tags`,
 
 - **Obsidian vault** — point straight at the vault folder. This always works.
 - **gbrain** — `GBRAIN_HOME=<brain> gbrain export --dir <out>`, then point at `<out>`.
+  Add `--gbrain-history` to the build to read the brain's real `updated_at` and revision
+  history back out (read-only, optional — see below).
 
 ```bash
 python3 scripts/build_map.py <notes_dir> out.html --title "My Second Brain"
@@ -46,10 +48,49 @@ Useful flags:
   making the file work with no network at all.
 - `--strict-offline` — refuse to write anything unless a plausible official Cytoscape 3
   browser bundle is given. Validation is non-executing and best-effort.
+- `--gbrain` / `--gbrain-history` — read real timestamps from the brain (see below).
 
 By default the file loads Cytoscape from a pinned CDN URL and labels itself
 **Network runtime** in its header; with an inlined bundle it says **Local runtime**.
 The builder never downloads anything, and never writes to the vault.
+
+### Real GBrain timestamps (optional, read-only)
+
+An export does not carry GBrain's `updated_at` or any revision history, so a
+freshly exported or re-cloned vault reads as uniformly fresh by file time and
+uniformly ancient by `created`. When the user's notes came from a brain and
+`gbrain` is on PATH, offer:
+
+```bash
+python3 scripts/build_map.py <export_dir> out.html --gbrain            # backend updated_at
+python3 scripts/build_map.py <export_dir> out.html --gbrain-history    # + version history
+```
+
+- `--gbrain` batches `list_pages` through one `gbrain serve` MCP session;
+  `--gbrain-history` adds `get_versions` per matched page, which is what
+  separates a real content write from a re-embed, a rename or a revert.
+- Tuning: `--gbrain-history-limit N` (default 500, `0` = every eligible page),
+  `--gbrain-source ID`, `--gbrain-slug-prefix P`, `--gbrain-cmd BIN`,
+  `--gbrain-timeout S`, `--gbrain-required`.
+- **The default budget caps history at 500 pages.** On a larger brain that is a
+  `partial` build by construction — the unread pages keep an unverified backend
+  timestamp and `--gbrain-required` fails. Say so, and offer
+  `--gbrain-history-limit 0` for full coverage (one round-trip per page).
+- **Read-only and fail-open.** Only `list_pages` and `get_versions` are ever
+  called; past revision bodies are projected to timestamps as soon as they are
+  decoded and never rendered, and brain slugs/source ids never enter the file.
+  If gbrain is missing, broken, slow or unreadable the build still succeeds
+  from Markdown and warns — so it is safe to try. Markdown-only is the default.
+- **Partial reads say so.** A truncated page index, a slug that lives in two
+  sources, a page whose history failed or came back partly unreadable, or a
+  budget that stopped short all make the build `partial`: the CLI warns and
+  lists the gaps with counts, matched notes still keep the brain's timestamps,
+  the rest keep Markdown, and `--gbrain-required` refuses to write at all.
+  History is only ever read for slugs proven to belong to exactly one page — a
+  concrete `--gbrain-source` is audited against `source_id='__all__'` first,
+  because `get_versions` takes a bare slug and would otherwise answer with two
+  sources' revisions merged.
+- Semantics, replay/diff rules and backend limits: `docs/gbrain-history.md`.
 
 ### Dependencies are optional
 
@@ -74,7 +115,8 @@ The builder never downloads anything, and never writes to the vault.
 - **Timeline** = `created` timestamps bucketed by month, stacked by theme. When a
   note has no `created` in its frontmatter, the file's own birth/modified time is
   used instead, so vanilla Obsidian vaults still get a timeline.
-- **Freshness** = first of `last_updated`, `updated`, `modified`, then `created`, then
+- **Freshness** = the GBrain stamp when `--gbrain` is on, else the first of
+  `last_updated`, `updated`, `modified`, then `created`, then
   the file timestamp. Age in days lands each note in one of five bands — **fresh** ≤7d,
   **recent** ≤30d, **settled** ≤90d, **dormant** ≤365d, **oxidized** >365d (`unknown`
   only when no date exists at all). Bands drive filters and labels; a separate
@@ -93,7 +135,8 @@ legible map. save-note's people-registry + `[[links]]` are what make it cluster.
 - **Click** a node → dim the rest, light up its neighbourhood, render the selection at
   full strength, and open the inspector: freshness band, age in days, updated timestamp,
   which field it came from, created date, link count, orphan status, path, summary, tags,
-  and a clickable list of connected notes.
+  and a clickable list of connected notes. With `--gbrain-history` it also states the
+  revision count, whether history confirmed the timestamp, and any later non-content touch.
 - Responsive: collapses to a phone-friendly layout on narrow screens; honours
   `prefers-reduced-motion`.
 
@@ -110,7 +153,11 @@ python3 scripts/build_map.py /tmp/demo-vault demo.html --title "Demo"
 ## Report
 
 Give the user the output path, headline counts (nodes/edges/date span), and the
-theme + type breakdown. Offer `open out.html`, or screenshot it headless:
+theme + type breakdown. When the adapter ran, also relay the `gbrain :` line —
+how many notes matched the brain and how many revisions were found — and say so
+plainly if it fell back to Markdown or came back `PARTIAL` (that line names what
+was missed). Offer `open out.html`, or screenshot it
+headless:
 
 ```bash
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
@@ -120,6 +167,6 @@ theme + type breakdown. Offer `open out.html`, or screenshot it headless:
 
 ## Notes
 
-- Read-only: never writes to the vault or the brain.
+- Read-only: never writes to the vault or the brain, with or without `--gbrain`.
 - Title collisions get a short hash suffix so no note is dropped.
 - Re-run after adding notes to refresh; it's idempotent.
