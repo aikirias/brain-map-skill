@@ -1,0 +1,7 @@
+# Optional — only for the browser-level tests (tests/test_browser_ui.py).
+# Without it those tests skip with an install hint and the rest of the suite
+# (stdlib unittest, no dependencies) still runs.
+#
+#   pip install -r requirements-test.txt
+#   python3 -m playwright install chromium
+playwright>=1.44,<2

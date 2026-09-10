@@ -171,8 +171,31 @@ All demo people, orgs and events are fictional — no real data.
 python3 -m unittest discover -s tests
 ```
 
-Stdlib `unittest` only — covers the freshness bands and score, GBrain slug resolution,
-payload shape, runtime inlining and refusal, template safety contracts, and CLI error handling.
+Stdlib `unittest`, no dependencies — covers the freshness bands and score, GBrain slug
+resolution, payload shape, `--keep-positions` (parsing, surviving notes, placement of new
+notes, malformed and non-finite payloads), runtime inlining and refusal, template safety
+contracts, and CLI error handling. Browser tests skip here with an install hint.
+
+**Browser tests** drive a generated map with real Cytoscape — search, filtering, the
+inspector, the timeline and Audit mode, through actual clicks, drags and key presses:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-test.txt
+.venv/bin/python -m playwright install chromium
+.venv/bin/python -m unittest discover -s tests -p "test_browser_ui.py" -v
+```
+
+The map under test inlines a local Cytoscape bundle, so the browser needs no network. The
+bundle is taken from `$CYTOSCAPE_JS` if set, else `tests/.cache/cytoscape.min.js`, else
+downloaded once from the pinned CDN URL and checksum-verified into that cache:
+
+```bash
+CYTOSCAPE_JS=/path/to/cytoscape.min.js .venv/bin/python -m unittest discover -s tests -v
+```
+
+Playwright is the only optional dependency: without it (or its Chromium) the browser tests
+skip and say how to install them; the command above runs them.
 
 ## GBrain coverage and roadmap
 
@@ -203,12 +226,14 @@ brain-map-skill/
 │   ├── build_map.py              # the builder (Markdown dir → interactive HTML)
 │   └── generate_demo_notes.py    # writes the fictional demo vault
 ├── tests/
-│   └── test_build_map.py         # stdlib unittest suite
+│   ├── test_build_map.py         # stdlib unittest suite
+│   └── test_browser_ui.py        # Playwright UI tests (optional dependency)
 ├── demo/
 │   ├── brain-map.html            # PREBUILT — open it, zero setup
 │   ├── vault/                    # 992 source Markdown notes
 │   └── preview.png
 ├── requirements.txt              # optional: networkx, numpy, scipy
+├── requirements-test.txt         # optional: playwright (browser tests only)
 └── LICENSE
 ```
 

@@ -394,11 +394,29 @@ def node_size(deg):
     return round(12 + 5.0 * math.sqrt(min(max(deg, 0), 49)), 1)
 
 
+def _coordinate(value):
+    """A finite float, or None when the payload holds something unusable.
+
+    JSON permits `NaN`/`Infinity` literals and hand-edited maps hold anything at
+    all; a non-finite coordinate would silently poison the layout (Cytoscape
+    drops the node, and any new note placed at the centroid of its neighbours
+    inherits the NaN). Rejecting it here keeps the bad value out of the map."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def read_positions(path):
     """{node id: (x, y)} recovered from a previously generated brain-map HTML.
 
     Powers --keep-positions: rebuilding after edits keeps every surviving note
-    where the reader already knows it, instead of reshuffling the whole sky."""
+    where the reader already knows it, instead of reshuffling the whole sky.
+    Nodes whose coordinates are missing, non-numeric or non-finite are skipped
+    rather than trusted — a partly readable map still keeps what it can."""
     try:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
@@ -412,11 +430,19 @@ def read_positions(path):
     except json.JSONDecodeError as exc:
         raise ValueError(f"{path}: embedded payload is not valid JSON: {exc}") from exc
     out = {}
-    for node in data.get("nodes", []):
+    raw_nodes = data.get("nodes")
+    for node in raw_nodes if isinstance(raw_nodes, list) else []:
+        if not isinstance(node, dict):
+            continue
+        meta = node.get("data")
+        nid = meta.get("id") if isinstance(meta, dict) else None
         p = node.get("position")
-        nid = node.get("data", {}).get("id")
-        if nid and isinstance(p, dict) and "x" in p and "y" in p:
-            out[nid] = (float(p["x"]), float(p["y"]))
+        if not isinstance(nid, str) or not isinstance(p, dict):
+            continue
+        x, y = _coordinate(p.get("x")), _coordinate(p.get("y"))
+        if x is None or y is None:
+            continue
+        out[nid] = (x, y)
     if not out:
         raise ValueError(f"{path} holds no node positions (was it built with a preset layout?)")
     return out
